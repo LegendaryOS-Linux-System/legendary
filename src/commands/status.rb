@@ -1,5 +1,3 @@
-# frozen_string_literal: true
-
 require_relative "../colors"
 require_relative "../banner"
 require_relative "../system_info"
