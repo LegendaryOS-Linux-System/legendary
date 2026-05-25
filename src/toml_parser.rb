@@ -1,5 +1,3 @@
-# frozen_string_literal: true
-
 module LegendaryOS
   # Minimal TOML parser – handles the subset used in version.toml
   # (sections, string values, integer values, quoted strings)
