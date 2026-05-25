@@ -1,5 +1,3 @@
-# frozen_string_literal: true
-
 module LegendaryOS
   # ANSI color palette inspired by the LegendaryOS phoenix:
   # Deep purple, vivid magenta, electric blue, cyan, dark navy
