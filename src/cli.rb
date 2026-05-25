@@ -1,5 +1,3 @@
-# frozen_string_literal: true
-
 require_relative "colors"
 require_relative "banner"
 require_relative "system_info"
@@ -8,6 +6,8 @@ require_relative "commands/doctor"
 require_relative "commands/info"
 require_relative "commands/help"
 require_relative "commands/update"
+require_relative "commands/build"
+require_relative "commands/game"
 
 module LegendaryOS
   VERSION = "0.0.1"
@@ -16,7 +16,7 @@ module LegendaryOS
     include Colors
 
     def initialize(argv)
-      @argv = argv
+      @argv    = argv
       @command = argv[0]&.downcase&.strip
       @args    = argv[1..]
     end
@@ -31,6 +31,10 @@ module LegendaryOS
         Commands::Info.new.run
       when "update"
         Commands::Update.new(@args).run
+      when "build"
+        Commands::Build.new(@args).run
+      when "game"
+        Commands::Game.new.run
       when "help", "--help", "-h"
         Commands::Help.new.run(@args&.first)
       when "version", "--version", "-v"
