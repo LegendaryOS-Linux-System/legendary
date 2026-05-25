@@ -1,5 +1,3 @@
-# frozen_string_literal: true
-
 require_relative "../colors"
 require_relative "../banner"
 
@@ -10,47 +8,59 @@ module LegendaryOS
 
       COMMANDS = [
         {
-          name:  "status",
-          usage: "legendary status",
-          desc:  "Pokaż pełny status systemu — wersja LegendaryOS, Fedora, KCM, hardware",
-          color: Colors::VIVID_MAGENTA,
-        },
+         name:  "status",
+         usage: "legendary status",
+         desc:  "Pokaż pełny status systemu — wersja LegendaryOS, Fedora, KCM, hardware",
+         color: Colors::VIVID_MAGENTA,
+         },
         {
-          name:  "update",
-          usage: "legendary update [--bootc] [--flatpak] [--firmware]",
-          desc:  "Aktualizuj system: obraz bootc · aplikacje Flatpak · firmware",
-          color: Colors::ELECTRIC_BLUE,
-          note:  "Wymaga sudo",
-        },
+         name:  "update",
+         usage: "legendary update [--bootc] [--flatpak] [--firmware]",
+         desc:  "Aktualizuj system: obraz bootc/rpm-ostree · aplikacje Flatpak · firmware · Distrobox",
+         color: Colors::ELECTRIC_BLUE,
+         note:  "Wymaga sudo",
+         },
         {
-          name:  "doctor",
-          usage: "legendary doctor",
-          desc:  "Diagnostyka systemu — sprawdź stan instalacji",
-          color: Colors::SKY_CYAN,
-        },
+         name:  "build",
+         usage: "legendary build <iso|cloud|--release>",
+         desc:  "Zbuduj obraz LegendaryOS: ISO instalacyjny, obraz cloud lub pełny release",
+         color: Colors::VIVID_MAGENTA,
+         note:  "Wymaga legendaryos-builder",
+         },
         {
-          name:  "info",
-          usage: "legendary info",
-          desc:  "Szybki przegląd wersji narzędzia i systemu",
-          color: Colors::LAVENDER,
-        },
+         name:  "game",
+         usage: "legendary game",
+         desc:  "Uruchom Phoenix Runner — grę zręcznościową osadzoną w świecie LegendaryOS",
+         color: Colors::PINK_MAGENTA,
+         },
         {
-          name:  "help",
-          usage: "legendary help [command]",
-          desc:  "Wyświetl tę pomoc",
-          color: Colors::PERIWINKLE,
-        },
+         name:  "doctor",
+         usage: "legendary doctor",
+         desc:  "Diagnostyka systemu — sprawdź stan instalacji",
+         color: Colors::SKY_CYAN,
+         },
         {
-          name:  "version",
-          usage: "legendary version",
-          desc:  "Wydrukuj wersję narzędzia i zakończ",
-          color: Colors::INDIGO,
-        },
-      ].freeze
+         name:  "info",
+         usage: "legendary info",
+         desc:  "Szybki przegląd wersji narzędzia i systemu",
+         color: Colors::LAVENDER,
+         },
+        {
+         name:  "help",
+         usage: "legendary help [command]",
+         desc:  "Wyświetl tę pomoc",
+         color: Colors::PERIWINKLE,
+         },
+        {
+         name:  "version",
+         usage: "legendary version",
+         desc:  "Wydrukuj wersję narzędzia i zakończ",
+         color: Colors::INDIGO,
+         },
+        ].freeze
 
       def run(cmd = nil)
         Banner.print_banner
-
         Banner.section("Dostępne komendy")
         puts
 
