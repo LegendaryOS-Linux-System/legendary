@@ -10,7 +10,7 @@ module LegendaryOS
 
       # Mapowanie flag CLI na argumenty legendaryos-update
       STAGE_FLAGS = {
-        "bootc"    => "--bootc",
+        "system"   => "--system",
         "flatpak"  => "--flatpak",
         "firmware" => "--firmware",
       }.freeze
@@ -22,7 +22,6 @@ module LegendaryOS
       def run
         Banner.print_mini_banner
 
-        # Nagłówek komendy
         puts "  #{Colors::VIVID_MAGENTA}#{Colors::BOLD}⚡  legendary update#{Colors::RESET}  " \
              "#{Colors::SUBTLE}— Aktualizacja systemu LegendaryOS#{Colors::RESET}"
         puts Colors.paint("  " + "─" * 60, Colors::DARK_VIOLET)
@@ -31,18 +30,18 @@ module LegendaryOS
         check_updater_present!
         check_root!
 
-        # Zbuduj argumenty dla legendaryos-update
         update_args = build_args
 
         puts "  #{Colors::LABEL}#{Colors::BOLD}Zakresy aktualizacji:#{Colors::RESET}"
         print_stages(update_args)
         puts
+
         puts Colors.paint("  " + "─" * 60, Colors::DARK_VIOLET)
         puts
+
         puts "  #{Colors::SUBTLE}Przekazuję sterowanie do #{Colors::BOLD}#{Colors::INDIGO}legendaryos-update#{Colors::RESET}#{Colors::SUBTLE}…#{Colors::RESET}"
         puts
 
-        # Handoff – exec zastępuje bieżący proces
         cmd = [UPDATER_BIN] + update_args
         exec(*cmd)
       rescue Errno::ENOENT
@@ -52,29 +51,29 @@ module LegendaryOS
       private
 
       def build_args
-        # Brak dodatkowych argumentów → wszystko
-        stages = @args.select { |a| STAGE_FLAGS.key?(a.sub(/^--/, "")) }
+        # Normalizuj: usuń wiodące "--" jeśli użytkownik podał --system itp.
+        normalized = @args.map { |a| a.sub(/^--/, "") }
+        stages = normalized.select { |a| STAGE_FLAGS.key?(a) }
 
         if stages.empty?
-          # Domyślnie wszystko
-          []
+          []  # brak flag → legendaryos-update zaktualizuje wszystko
         else
-          stages.map { |s| STAGE_FLAGS[s.sub(/^--/, "")] }.compact
+          stages.map { |s| STAGE_FLAGS[s] }.compact
         end
       end
 
       def print_stages(update_args)
         all = update_args.empty?
         stages = [
-          { flag: "--bootc",    label: "System Image (bootc)", color: Colors::VIVID_MAGENTA, icon: "⬡" },
-          { flag: "--flatpak",  label: "Flatpak Applications", color: Colors::ELECTRIC_BLUE, icon: "⬡" },
-          { flag: "--firmware", label: "Firmware (fwupd)",     color: Colors::SKY_CYAN,      icon: "⬡" },
+          { flag: "--system",   label: "System Image (bootc / rpm-ostree)", color: Colors::VIVID_MAGENTA, icon: "⬡" },
+          { flag: "--flatpak",  label: "Flatpak Applications",              color: Colors::ELECTRIC_BLUE, icon: "⬡" },
+          { flag: "--firmware", label: "Firmware (fwupd)",                  color: Colors::SKY_CYAN,      icon: "⬡" },
         ]
 
         stages.each do |s|
-          active = all || update_args.include?(s[:flag])
-          icon_s = active ? "#{s[:color]}#{Colors::BOLD}  #{s[:icon]}#{Colors::RESET}" \
-                          : "#{Colors::SUBTLE}  ○#{Colors::RESET}"
+          active  = all || update_args.include?(s[:flag])
+          icon_s  = active ? "#{s[:color]}#{Colors::BOLD}  #{s[:icon]}#{Colors::RESET}" \
+                           : "#{Colors::SUBTLE}  ○#{Colors::RESET}"
           label_s = active ? "#{s[:color]}#{Colors::BOLD}#{s[:label]}#{Colors::RESET}" \
                            : "#{Colors::SUBTLE}#{s[:label]} (pominięty)#{Colors::RESET}"
           puts "  #{icon_s}  #{label_s}"
