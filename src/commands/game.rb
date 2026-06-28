@@ -11,13 +11,9 @@ module LegendaryOS
             GEM_HOME     = File.join(VENV_BASE, "gems")
             GOSU_VERSION = "~> 1.4"
 
-            # Katalog gry leży zawsze obok src/ — czyli dwa poziomy wyżej względem tego pliku:
-            # /usr/share/LegendaryOS/tools/legendary/src/commands/game.rb
-            #                                         ├── src/
-            #                                         └── game/main.rb   ← tu
-            TOOL_ROOT  = File.expand_path("../../..", __FILE__)
-            GAME_DIR   = File.join(TOOL_ROOT, "game")
-            GAME_ENTRY = File.join(GAME_DIR, "main.rb")
+            # Stała ścieżka do gry LegendaryOS-Game:
+            GAME_ENTRY = "/usr/share/LegendaryOS/tools/LegendaryOS-Game/main.rb"
+            GAME_DIR   = File.dirname(GAME_ENTRY)
 
             def run
                 Banner.print_mini_banner
