@@ -1,0 +1,25 @@
+[package]
+name = "legendary"
+version = "0.1.0"
+kind = "bin"
+entry = "mod/main.zsharp"
+description = "legendary — narzędzie systemowe LegendaryOS (uruchamianie narzędzi, TUI, bateria, diagnostyka), napisane w 100% w Z#"
+license = "Apache-2.0"
+
+# Manifest dla pierwszego budowania bez nuli (`z# build --release -o legendary`).
+# Normalnie wystarczy `nula build --release` — nula sama generuje taki plik z nula.hk i kodu (build/cache/z/).
+[workspace.members]
+Util     = "mod/util.zsharp"
+Ui       = "mod/ui.zsharp"
+Cli      = "mod/cli.zsharp"
+Hk       = "mod/hk.zsharp"
+Help     = "mod/help.zsharp"
+Plan     = "mod/plan.zsharp"
+Lpm      = "mod/lpm.zsharp"
+Tools    = "mod/tools.zsharp"
+Battery  = "mod/battery.zsharp"
+Sysinfo  = "mod/sysinfo.zsharp"
+Services = "mod/services.zsharp"
+Doctor   = "mod/doctor.zsharp"
+Complete = "mod/complete.zsharp"
+Tui      = "mod/tui.zsharp"
