@@ -1,0 +1,262 @@
+namespace Tools;
+
+import Std.Os;
+import Std.Text;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Cli;
+import Workspace.Hk;
+import Workspace.Lpm;
+
+##
+ * Tools — narzędzia z /tools (repozytorium git → obraz squashfs, montowany tylko do odczytu).
+ * Zastępuje skrypt `legendary-tool`:   legendary run blue-environment
+ *
+ *   run [--dry-run|-n] [--where] [--system] <narzędzie> [argumenty...]
+ *   tools list | catalog | info <n> | install <n...>|--all | update <n>|--all | remove <n> | path <n> | mount
+##
+
+func catalogPath() {
+    $e = Os.env("LEGENDARY_TOOLS_CATALOG", "");
+    if ($e !== "") { return $e; }
+    return Util.firstExisting(["/usr/share/legendaryos/tools.hk", "/system/share/legendaryos/tools.hk"]);
+}
+
+# katalog: nazwa => ["git", "entry", "build", "rev"] (pusty, gdy brak pliku)
+func catalog() {
+    $p = catalogPath();
+    if ($p === null) { return []; }
+    $doc = Hk.parse(Os.readFile($p), $p);
+    $out = [];
+    foreach (Hk.section($doc, "tools") as $name => $v) {
+        if (!is_array($v)) { continue; }
+        $out[$name] = ["git" => Hk.get(["x" => $v], "x", "git", ""), "entry" => Hk.get(["x" => $v], "x", "entry", ""),
+            "build" => Hk.get(["x" => $v], "x", "build", ""), "rev" => Hk.get(["x" => $v], "x", "rev", "")];
+    }
+    return $out;
+}
+
+func installedMap() {
+    $m = [];
+    foreach (Lpm.toolList() as $t) { $m[$t["name"]] = $t; }
+    return $m;
+}
+
+# najbliższe nazwy (odległość Levenshteina ≤ 3, albo zawieranie)
+func suggest($name, $known) {
+    $out = [];
+    foreach ($known as $k) {
+        if (Text.levenshtein($name, $k) <= 3 || contains($k, $name) || contains($name, $k)) { $out[] = $k; }
+    }
+    return $out;
+}
+
+func knownNames() {
+    $names = [];
+    foreach (catalog() as $n => $v) { $names[] = $n; }
+    foreach (Lpm.toolList() as $t) { if (!in_array($t["name"], $names)) { $names[] = $t["name"]; } }
+    return $names;
+}
+
+func needRoot($what) {
+    if (Util.isRoot()) { return true; }
+    Ui.error($what . " wymaga roota (/tools jest tylko do odczytu)");
+    Ui.hint("spróbuj: sudo legendary " . join(Os.args(), " "));
+    return false;
+}
+
+# ───────────────── run ─────────────────
+func run($args) {
+    $dry = false;
+    $where = false;
+    $system = false;
+    $i = 0;
+    while ($i < count($args) && starts_with($args[$i], "-") && $args[$i] !== "--") {
+        $a = $args[$i];
+        if ($a === "--dry-run" || $a === "-n") { $dry = true; }
+        else if ($a === "--where") { $where = true; }
+        else if ($a === "--system") { $system = true; }
+        else { Ui.error("nieznana opcja `" . $a . "` dla `run` (opcje stoją PRZED nazwą narzędzia; argumenty narzędzia — po nazwie)"); return 2; }
+        $i++;
+    }
+    if ($i < count($args) && $args[$i] === "--") { $i++; }
+    if ($i >= count($args)) {
+        Ui.error("użycie: legendary run [--dry-run] [--where] [--system] <narzędzie> [argumenty...]");
+        Ui.hint("np. legendary run blue-environment   (lista: legendary tools list)");
+        return 2;
+    }
+    $name = $args[$i];
+    $pass = array_slice($args, $i + 1);
+    if (!Lpm.available() && !$system) {
+        Ui.error("nie znaleziono `" . Lpm.bin() . "` w PATH — bez lpm nie wiem, gdzie leżą narzędzia z /tools");
+        Ui.hint("na systemie bez lpm użyj: legendary run --system " . $name);
+        return 127;
+    }
+    $exe = $system ? null : Lpm.toolPath($name);
+    if ($exe === null && $system) {
+        $exe = Os.which($name);
+        if ($exe === null) { Ui.error("nie znaleziono `" . $name . "` w PATH"); return 127; }
+    }
+    if ($exe === null) { return notInstalled($name); }
+    if ($where) { echo $exe; return 0; }
+    if ($dry) {
+        echo Ui.dim("[dry-run] ") . $exe . (count($pass) > 0 ? " " . join($pass, " ") : "");
+        return 0;
+    }
+    Os.setEnv("LEGENDARY_TOOL", $name);
+    Ui.verbose("exec " . $exe);
+    return Util.inherit($exe, $pass);
+}
+
+func notInstalled($name) {
+    $cat = catalog();
+    if (has_key($cat, $name)) {
+        Ui.error("narzędzie `" . $name . "` jest w katalogu, ale nie jest zainstalowane");
+        Ui.hint("zainstaluj: sudo legendary install " . $name);
+        return 127;
+    }
+    Ui.error("nie ma narzędzia `" . $name . "` (ani zainstalowanego, ani w katalogu)");
+    $s = suggest($name, knownNames());
+    if (count($s) > 0) { Ui.hint("czy chodziło o: " . join($s, ", ") . "?"); }
+    else { Ui.hint("dodaj je: sudo lpm tools add " . $name . " <git> <ścieżka-w-obrazie>   albo wpis w tools.hk"); }
+    return 127;
+}
+
+# ───────────────── tools ... ─────────────────
+func stateText($inst, $name) {
+    if (!has_key($inst, $name)) { return Ui.gray("niezainstalowane"); }
+    return $inst[$name]["mounted"] ? Ui.green("zamontowane") : Ui.yellow("odmontowane");
+}
+
+# wiersze do tabeli/TUI: [name, state(raw), commit, git]
+func rows() {
+    $cat = catalog();
+    $inst = installedMap();
+    $names = [];
+    foreach ($cat as $n => $v) { $names[] = $n; }
+    foreach ($inst as $n => $v) { if (!in_array($n, $names)) { $names[] = $n; } }
+    $out = [];
+    foreach (Util.sortStrings($names) as $n) {
+        $state = !has_key($inst, $n) ? "niezainstalowane" : ($inst[$n]["mounted"] ? "zamontowane" : "odmontowane");
+        $out[] = ["name" => $n, "state" => $state, "installed" => has_key($inst, $n),
+            "commit" => has_key($inst, $n) ? $inst[$n]["commit"] : "", "git" => has_key($cat, $n) ? $cat[$n]["git"] : "",
+            "inCatalog" => has_key($cat, $n)];
+    }
+    return $out;
+}
+
+func colorState($s) {
+    if ($s === "zamontowane") { return Ui.green($s); }
+    if ($s === "odmontowane") { return Ui.yellow($s); }
+    return Ui.gray($s);
+}
+
+func cmdList($p) {
+    if (!Lpm.available()) { Ui.warn("brak `" . Lpm.bin() . "` — pokazuję tylko katalog"); }
+    $r = rows();
+    if (count($r) === 0) {
+        Ui.info("brak narzędzi (katalog: " . (catalogPath() ?? "nie znaleziono tools.hk") . ")");
+        return 0;
+    }
+    if (Cli.has($p, "--installed")) { $r = filter($r, fn($x) => $x["installed"]); }
+    $t = [];
+    foreach ($r as $x) { $t[] = [Ui.bold($x["name"]), colorState($x["state"]), $x["commit"] === "" ? "-" : $x["commit"], Ui.dim(Ui.clip($x["git"], 48))]; }
+    Ui.printLines(Ui.table(["Narzędzie", "Stan", "Commit", "Źródło"], $t));
+    return 0;
+}
+
+func cmdCatalog($p) {
+    $path = catalogPath();
+    if ($path === null) { Ui.error("nie znaleziono tools.hk (/usr/share/legendaryos/tools.hk)"); return 1; }
+    $t = [];
+    foreach (catalog() as $n => $v) { $t[] = [Ui.bold($n), $v["entry"], Ui.dim($v["git"])]; }
+    Ui.info("katalog: " . $path);
+    Ui.printLines(Ui.table(["Narzędzie", "Plik wykonywalny", "Źródło"], $t));
+    return 0;
+}
+
+func cmdInfo($p) {
+    $name = Cli.pos($p, 0);
+    if ($name === null) { Ui.error("użycie: legendary tools info <narzędzie>"); return 2; }
+    $cat = catalog();
+    $inst = installedMap();
+    if (!has_key($cat, $name) && !has_key($inst, $name)) { return notInstalled($name); }
+    $L = [];
+    $L[] = Ui.kv("Stan", stateText($inst, $name), 16);
+    if (has_key($inst, $name)) { $L[] = Ui.kv("Commit", $inst[$name]["commit"], 16); }
+    if (has_key($cat, $name)) {
+        $L[] = Ui.kv("Git", $cat[$name]["git"], 16);
+        $L[] = Ui.kv("Plik w obrazie", $cat[$name]["entry"], 16);
+        if ($cat[$name]["build"] !== "") { $L[] = Ui.kv("Budowanie", $cat[$name]["build"], 16); }
+        if ($cat[$name]["rev"] !== "") { $L[] = Ui.kv("Rewizja", $cat[$name]["rev"], 16); }
+    }
+    if (has_key($inst, $name)) { $L[] = Ui.kv("Ścieżka", Lpm.toolPath($name) ?? Ui.gray("?"), 16); }
+    Ui.printLines(Ui.box("Narzędzie · " . $name, $L, 48));
+    return 0;
+}
+
+func lpmTools($sub, $extra, $what) {
+    if (!needRoot($what)) { return 1; }
+    return Lpm.passthrough(array_merge_list(["tools", $sub], $extra));
+}
+
+func array_merge_list($a, $b) {
+    $out = $a;
+    foreach ($b as $x) { $out[] = $x; }
+    return $out;
+}
+
+func cmdInstall($p) {
+    if (Cli.has($p, "--all")) { return lpmTools("add-all", [], "instalacja narzędzi"); }
+    if (count($p["pos"]) === 0) { Ui.error("użycie: legendary install <narzędzie...> | --all"); Ui.hint("dostępne: legendary tools catalog"); return 2; }
+    $fails = 0;
+    foreach ($p["pos"] as $n) {
+        if (!has_key(catalog(), $n) && count($p["pos"]) === 1 && count($p["rest"]) < 2) {
+            Ui.warn("`" . $n . "` nie ma w katalogu — dodaj je ręcznie: legendary install " . $n . " -- <git> <ścieżka-w-obrazie>");
+            if (count($p["rest"]) === 0) { return 1; }
+        }
+        $extra = array_merge_list([$n], $p["rest"]);
+        if (lpmTools("add", $extra, "instalacja narzędzia") !== 0) { $fails++; }
+    }
+    return $fails === 0 ? 0 : 1;
+}
+
+func cmdUpdate($p) {
+    if (Cli.has($p, "--all") || count($p["pos"]) === 0) {
+        $fails = 0;
+        foreach (Lpm.toolList() as $t) { if (lpmTools("update", [$t["name"]], "aktualizacja narzędzi") !== 0) { $fails++; } }
+        return $fails === 0 ? 0 : 1;
+    }
+    $fails = 0;
+    foreach ($p["pos"] as $n) { if (lpmTools("update", [$n], "aktualizacja narzędzia") !== 0) { $fails++; } }
+    return $fails === 0 ? 0 : 1;
+}
+
+func cmd($args) {
+    $sub = count($args) > 0 ? $args[0] : "list";
+    $p = Cli.parse(array_slice($args, count($args) > 0 ? 1 : 0), []);
+    try {
+        if ($sub === "list" || $sub === "ls") { return cmdList($p); }
+        if ($sub === "catalog") { return cmdCatalog($p); }
+        if ($sub === "info") { return cmdInfo($p); }
+        if ($sub === "install" || $sub === "add") { return cmdInstall($p); }
+        if ($sub === "update" || $sub === "upgrade") { return cmdUpdate($p); }
+        if ($sub === "remove" || $sub === "rm") {
+            if (count($p["pos"]) === 0) { Ui.error("użycie: legendary tools remove <narzędzie>"); return 2; }
+            return lpmTools("remove", [$p["pos"][0]], "usuwanie narzędzia");
+        }
+        if ($sub === "mount") { return lpmTools("mount-all", [], "montowanie narzędzi"); }
+        if ($sub === "path") {
+            if (count($p["pos"]) === 0) { Ui.error("użycie: legendary tools path <narzędzie>"); return 2; }
+            $x = Lpm.toolPath($p["pos"][0]);
+            if ($x === null) { return notInstalled($p["pos"][0]); }
+            echo $x;
+            return 0;
+        }
+    } catch (Exception $e) {
+        Ui.error($e->getMessage());
+        return 1;
+    }
+    Ui.error("nieznane polecenie `tools " . $sub . "` (legendary help tools)");
+    return 2;
+}
