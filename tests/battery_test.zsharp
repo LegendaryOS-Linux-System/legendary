@@ -1,0 +1,137 @@
+import Std.Os;
+import Workspace.Battery;
+import Workspace.Ui;
+import Workspace.Util;
+import Workspace.Plan;
+
+# Test modułu Battery na sztucznym sysfs (katalog tymczasowy). Wynik: tests/battery_test.out.
+
+$tmp = "/tmp/legendary-test-battery";
+Os.removeAll($tmp);
+Os.mkdir($tmp);
+Os.setEnv("LEGENDARY_COLOR", "never");
+Os.setEnv("TZ", "UTC");
+Os.setEnv("LEGENDARY_SYSFS_ROOT", $tmp . "/ps");
+Os.setEnv("LEGENDARY_BATTERY_CONF", $tmp . "/etc/battery.hk");
+Os.setEnv("LEGENDARY_RUN_DIR", $tmp . "/run");
+Os.setEnv("LEGENDARY_STATE_DIR", $tmp . "/state");
+
+func put($path, $text) { Util.ensureDir(dirnameOf($path)); Os.writeFile($path, $text . "\n"); }
+func dirnameOf($p) { return substr($p, 0, strlen($p) - strlen(lastPart($p)) - 1); }
+func lastPart($p) { $a = split($p, "/"); return $a[count($a) - 1]; }
+func rd($rel) { return trim(Os.readFile(Os.env("LEGENDARY_SYSFS_ROOT") . "/" . $rel)); }
+
+$b = $tmp . "/ps/BAT0/";
+put($b . "type", "Battery");
+put($b . "status", "Charging");
+put($b . "capacity", "62");
+put($b . "energy_now", "31000000");
+put($b . "energy_full", "47000000");
+put($b . "energy_full_design", "52000000");
+put($b . "power_now", "20000000");
+put($b . "voltage_now", "12000000");
+put($b . "cycle_count", "214");
+put($b . "temp", "345");
+put($b . "technology", "Li-ion");
+put($b . "manufacturer", "LGC");
+put($b . "model_name", "5B10W13");
+put($b . "charge_control_start_threshold", "40");
+put($b . "charge_control_end_threshold", "80");
+put($tmp . "/ps/AC/type", "Mains");
+put($tmp . "/ps/AC/online", "1");
+
+echo "=== status (domyślna konfiguracja: profil smart / balanced)";
+Battery.cmd(["status"]);
+
+echo "=== apply → powinno zapisać 75-90 (podnosimy koniec: najpierw end, potem start)";
+Battery.cmd(["apply"]);
+echo "start=" . rd("BAT0/charge_control_start_threshold") . " end=" . rd("BAT0/charge_control_end_threshold");
+
+echo "=== apply ponownie → bez zmian";
+Battery.cmd(["apply"]);
+
+echo "=== limit 60 (obniżamy koniec: najpierw start) → custom 55-60";
+Battery.cmd(["limit", "60"]);
+echo "start=" . rd("BAT0/charge_control_start_threshold") . " end=" . rd("BAT0/charge_control_end_threshold");
+
+echo "=== limit 30 50";
+Battery.cmd(["limit", "30", "50"]);
+echo "start=" . rd("BAT0/charge_control_start_threshold") . " end=" . rd("BAT0/charge_control_end_threshold");
+
+echo "=== błędne limity";
+echo Battery.cmd(["limit", "150"]);
+echo Battery.cmd(["limit", "70", "60"]);
+echo Battery.cmd(["limit"]);
+
+echo "=== profile longevity, get/set";
+Battery.cmd(["profile", "longevity"]);
+echo "start=" . rd("BAT0/charge_control_start_threshold") . " end=" . rd("BAT0/charge_control_end_threshold");
+Battery.cmd(["get", "profile"]);
+Battery.cmd(["set", "smart.full_before", "7:30", "--no-apply"]);
+Battery.cmd(["get", "smart.full_before"]);
+Battery.cmd(["set", "smart.full_days", "mon,wed"]);
+echo Battery.cmd(["set", "smart.dock_hours", "0"]);
+echo Battery.cmd(["set", "nie.istnieje", "1"]);
+
+echo "=== plik konfiguracji zachował komentarze";
+$conf = Os.readFile($tmp . "/etc/battery.hk");
+echo starts_with($conf, "! LegendaryOS") ? "komentarz nagłówka: jest" : "komentarz nagłówka: BRAK";
+echo contains($conf, "! profil trybu") || contains($conf, "! smart: profil trybu stacjonarnego") ? "opisy kluczy: są" : "opisy kluczy: BRAK";
+
+echo "=== profile (lista)";
+Battery.cmd(["profile"]);
+
+echo "=== full → override, potem --off";
+Battery.cmd(["full"]);
+echo "start=" . rd("BAT0/charge_control_start_threshold") . " end=" . rd("BAT0/charge_control_end_threshold");
+echo Battery.readState()["override"];
+Battery.cmd(["full", "--off"]);
+echo "start=" . rd("BAT0/charge_control_start_threshold") . " end=" . rd("BAT0/charge_control_end_threshold");
+
+echo "=== ochrona termiczna (45,5 °C)";
+put($b . "temp", "455");
+Battery.cmd(["apply", "--dry-run"]);
+put($b . "temp", "345");
+
+echo "=== bateria typu charge_* (bez energy_*), bez progu startu";
+Os.removeAll($tmp . "/ps");
+$c = $tmp . "/ps/BAT1/";
+put($c . "type", "Battery");
+put($c . "status", "Discharging");
+put($c . "charge_now", "2500000");
+put($c . "charge_full", "4000000");
+put($c . "charge_full_design", "4500000");
+put($c . "current_now", "-1000000");
+put($c . "voltage_now", "11400000");
+put($c . "voltage_min_design", "11400000");
+put($c . "charge_control_end_threshold", "100");
+echo "=== status";
+Battery.cmd(["status"]);
+Battery.cmd(["apply"]);
+echo "end=" . rd("BAT1/charge_control_end_threshold");
+
+echo "=== json";
+$cur = Battery.current();
+echo $cur["snap"]["capacity"], $cur["snap"]["powerUw"], $cur["snap"]["energyNow"];
+
+echo "=== brak progów w sprzęcie";
+Os.removeAll($c . "charge_control_end_threshold");
+echo Battery.cmd(["apply"]);
+Battery.cmd(["caps"]);
+
+echo "=== brak baterii";
+Os.removeAll($tmp . "/ps");
+Util.ensureDir($tmp . "/ps");
+echo Battery.cmd(["status"]);
+
+echo "=== nextState";
+echo Battery.nextState(["ac_since" => null, "override" => ""], true, 50, "Charging", 100);
+echo Battery.nextState(["ac_since" => 100, "override" => "full"], true, 50, "Charging", 200);
+echo Battery.nextState(["ac_since" => 100, "override" => "full"], false, 50, "Discharging", 200);
+echo Battery.nextState(["ac_since" => 100, "override" => "full"], true, 100, "Full", 200);
+
+echo "=== historia";
+Util.ensureDir($tmp . "/state");
+Os.writeFile($tmp . "/state/battery.csv", Battery.csvHeader() . "\n1795680000,60,Charging,12.5,92,34.5,75,90,smart\n1795683600,75,Charging,11.0,92,35.0,75,90,smart\n1795687200,90,Not_charging,5.2,92,33.0,75,90,smart\n");
+Battery.cmd(["history"]);
+Os.removeAll($tmp);
