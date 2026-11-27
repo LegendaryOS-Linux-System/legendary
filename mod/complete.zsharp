@@ -1,0 +1,70 @@
+namespace Complete;
+
+import Workspace.Help;
+import Workspace.Ui;
+import Workspace.Plan;
+
+##
+ * Complete — generuje skrypty uzupełniania poleceń dla bash, zsh i fish.
+##
+
+func subs() {
+    return [
+        "battery" => ["status", "profile", "limit", "set", "get", "config", "apply", "full", "inhibit", "daemon", "watch", "history", "caps", "reset"],
+        "tools" => ["list", "catalog", "info", "install", "update", "remove", "path", "mount"],
+        "services" => ["list", "show"],
+        "system" => ["status", "update", "rollback", "deployments"],
+        "completions" => ["bash", "zsh", "fish"],
+        "help" => Help.names()
+    ];
+}
+
+func bash() {
+    $L = ["# bash — legendary", "_legendary() {", "  local cur=\"${COMP_WORDS[COMP_CWORD]}\" prev=\"${COMP_WORDS[COMP_CWORD-1]}\"",
+        "  local cmds=\"" . join(Help.names(), " ") . "\""];
+    $L[] = "  if [ \"$COMP_CWORD\" -eq 1 ]; then COMPREPLY=( $(compgen -W \"$cmds\" -- \"$cur\") ); return; fi";
+    $L[] = "  case \"${COMP_WORDS[1]}\" in";
+    foreach (subs() as $c => $s) {
+        $L[] = "    " . $c . ") [ \"$COMP_CWORD\" -eq 2 ] && COMPREPLY=( $(compgen -W \"" . join($s, " ") . "\" -- \"$cur\") ) ;;";
+    }
+    $L[] = "    run) [ \"$COMP_CWORD\" -eq 2 ] && COMPREPLY=( $(compgen -W \"$(legendary tools list --installed --no-color 2>/dev/null | awk 'NR>2{print $1}')\" -- \"$cur\") ) ;;";
+    $L[] = "  esac";
+    $L[] = "}";
+    $L[] = "complete -F _legendary legendary";
+    return join($L, "\n") . "\n";
+}
+
+func zsh() {
+    $L = ["#compdef legendary", "_legendary() {", "  local -a cmds", "  cmds=("];
+    foreach (Help.commands() as $c) { $L[] = "    '" . $c[0] . ":" . replace($c[2], "'", "") . "'"; }
+    $L[] = "  )";
+    $L[] = "  if (( CURRENT == 2 )); then _describe 'polecenie' cmds; return; fi";
+    $L[] = "  case $words[2] in";
+    foreach (subs() as $c => $s) { $L[] = "    " . $c . ") (( CURRENT == 3 )) && compadd " . join($s, " ") . " ;;"; }
+    $L[] = "    run) (( CURRENT == 3 )) && compadd ${(f)\"$(legendary tools list --installed --no-color 2>/dev/null | awk 'NR>2{print $1}')\"} ;;";
+    $L[] = "  esac";
+    $L[] = "}";
+    $L[] = "_legendary \"$@\"";
+    return join($L, "\n") . "\n";
+}
+
+func fish() {
+    $L = ["# fish — legendary", "complete -c legendary -f"];
+    foreach (Help.commands() as $c) {
+        $L[] = "complete -c legendary -n '__fish_use_subcommand' -a " . $c[0] . " -d '" . replace($c[2], "'", "") . "'";
+    }
+    foreach (subs() as $c => $s) {
+        $L[] = "complete -c legendary -n '__fish_seen_subcommand_from " . $c . "' -a '" . join($s, " ") . "'";
+    }
+    $L[] = "complete -c legendary -n '__fish_seen_subcommand_from run' -a '(legendary tools list --installed --no-color 2>/dev/null | awk \"NR>2{print \\$1}\")'";
+    return join($L, "\n") . "\n";
+}
+
+func cmd($args) {
+    $sh = count($args) > 0 ? $args[0] : "";
+    if ($sh === "bash") { necho(bash()); return 0; }
+    if ($sh === "zsh") { necho(zsh()); return 0; }
+    if ($sh === "fish") { necho(fish()); return 0; }
+    Ui.error("użycie: legendary completions bash|zsh|fish");
+    return 2;
+}
