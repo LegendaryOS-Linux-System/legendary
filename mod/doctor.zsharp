@@ -1,0 +1,87 @@
+namespace Doctor;
+
+import Std.Os;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Lpm;
+import Workspace.Tools;
+import Workspace.Battery;
+import Workspace.Services;
+
+##
+ * Doctor — diagnostyka środowiska. Wynik: lista ["status" => ok|warn|fail, "name", "detail", "hint"].
+##
+
+func chk($status, $name, $detail, $hintText = "") { return ["status" => $status, "name" => $name, "detail" => $detail, "hint" => $hintText]; }
+
+func run() {
+    $r = [];
+    # lpm
+    if (Lpm.available()) {
+        $r[] = chk("ok", "lpm", Lpm.version() ?? "jest");
+        $n = count(Lpm.toolList());
+        $r[] = $n > 0 ? chk("ok", "narzędzia /tools", $n . " zainstalowane") : chk("warn", "narzędzia /tools", "żadne narzędzie nie jest zainstalowane", "sudo legendary tools install --all");
+    } else {
+        $r[] = chk("fail", "lpm", "nie znaleziono w PATH", "legendary run/tools wymagają lpm (na obcym systemie: legendary run --system)");
+    }
+    $r[] = Os.isDir("/tools") ? chk("ok", "/tools", "katalog istnieje") : chk("warn", "/tools", "brak katalogu", "tworzy go legendary-state.service / lpm tools mount");
+    # katalog
+    $cp = Tools.catalogPath();
+    if ($cp === null) { $r[] = chk("warn", "katalog narzędzi", "nie znaleziono tools.hk", "oczekiwany: /usr/share/legendaryos/tools.hk"); }
+    else {
+        try { $r[] = chk("ok", "katalog narzędzi", count(Tools.catalog()) . " pozycji w " . $cp); }
+        catch (Exception $e) { $r[] = chk("fail", "katalog narzędzi", $e->getMessage()); }
+    }
+    # zenitd
+    $u = Services.units();
+    $r[] = count($u) > 0 ? chk("ok", "jednostki zenitd", count($u) . " znalezionych") : chk("warn", "jednostki zenitd", "brak w " . Services.dirs()[0] . " i pozostałych");
+    $r[] = Os.which("zenitd") !== null || Os.which("zenitctl") !== null ? chk("ok", "zenitd", "zenitd/zenitctl w PATH") : chk("warn", "zenitd", "nie znaleziono zenitd/zenitctl w PATH");
+    # bateria
+    $bat = Battery.devices();
+    if (count($bat) === 0) { $r[] = chk("ok", "bateria", "brak (komputer stacjonarny/VM) — funkcje baterii pominięte"); }
+    else {
+        $c = Battery.caps($bat[0]);
+        $r[] = $c["end"] !== null ? chk("ok", "progi ładowania", $bat[0] . ": " . $c["end"] . ($c["start"] !== null ? " + start" : "")) :
+            chk("warn", "progi ładowania", $bat[0] . ": sprzęt nie obsługuje progów", "legendary battery nadal pokaże stan i historię");
+        try {
+            $l = Battery.loadConfig();
+            $r[] = count($l["problems"]) === 0 ? chk("ok", "konfiguracja baterii", $l["path"] ?? "domyślna") : chk("warn", "konfiguracja baterii", join($l["problems"], "; "), "legendary battery config");
+        } catch (Exception $e) { $r[] = chk("fail", "konfiguracja baterii", $e->getMessage()); }
+        $r[] = Util.isRoot() ? chk("ok", "uprawnienia", "root — zapis progów możliwy") : chk("warn", "uprawnienia", "zwykły użytkownik — zapis progów/konfiguracji wymaga sudo");
+    }
+    # terminal
+    $lang = Os.env("LC_ALL", Os.env("LANG", ""));
+    $r[] = contains(upper($lang), "UTF") ? chk("ok", "terminal", "UTF-8, TERM=" . Os.env("TERM", "?")) : chk("warn", "terminal", "locale `" . $lang . "` — ramki/paski mogą wyglądać źle", "ustaw LANG=pl_PL.UTF-8");
+    foreach (["git", "mksquashfs"] as $t) {
+        $r[] = Os.which($t) !== null ? chk("ok", $t, "dostępny") : chk("warn", $t, "brak w PATH", "potrzebny do instalacji/aktualizacji narzędzi");
+    }
+    return $r;
+}
+
+func icon($s) {
+    if ($s === "ok") { return Ui.green("✔"); }
+    if ($s === "warn") { return Ui.yellow("!"); }
+    return Ui.red("✘");
+}
+
+func lines($res) {
+    $L = [];
+    foreach ($res as $c) {
+        $L[] = icon($c["status"]) . " " . Ui.padR(Ui.bold($c["name"]), 22) . $c["detail"];
+        if ($c["hint"] !== "" && $c["status"] !== "ok") { $L[] = "  " . Ui.gray("  ↳ " . $c["hint"]); }
+    }
+    return $L;
+}
+
+func cmd($args) {
+    $res = run();
+    Ui.printLines(Ui.box("Diagnostyka", lines($res), 60));
+    $f = 0;
+    $w = 0;
+    foreach ($res as $c) { if ($c["status"] === "fail") { $f++; } if ($c["status"] === "warn") { $w++; } }
+    echo "";
+    if ($f > 0) { Ui.error("błędy: " . $f . ", ostrzeżenia: " . $w); return 1; }
+    if ($w > 0) { Ui.warn("ostrzeżenia: " . $w . ", brak błędów"); return 0; }
+    Ui.ok("wszystko w porządku");
+    return 0;
+}
