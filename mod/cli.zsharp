@@ -1,0 +1,113 @@
+namespace Cli;
+
+##
+ * Cli — parser argumentów: `legendary [flagi globalne] <polecenie> [argumenty] [flagi] [-- reszta]`.
+ *
+ * split()  — wyciąga flagi globalne sprzed polecenia i samo polecenie; resztę zostawia SUROWĄ
+ *            (potrzebne `legendary run <narzędzie> <argumenty...>`, które przekazuje wszystko dalej).
+ * globalsIn() — wyciąga flagi globalne także zza polecenia (dla poleceń innych niż `run`).
+ * parse()  — flagi i argumenty pozycyjne; flagi z wartością podaje się w $valued; `--flaga=wartość` działa zawsze.
+ *            Wynik: ["pos" => [...], "flags" => [nazwa => wartość|true], "rest" => [...]]
+##
+
+func newGlobals() { return ["color" => "", "verbose" => false, "quiet" => false]; }
+
+# true, gdy $a jest flagą globalną; uzupełnia $g. Zwraca liczbę zjedzonych argumentów (0 = to nie flaga globalna).
+func eatGlobal($argv, $i, $g) {
+    $a = $argv[$i];
+    $n = count($argv);
+    if ($a === "--no-color") { return [1, "color", "never"]; }
+    if (starts_with($a, "--color=")) { return [1, "color", substr($a, 8)]; }
+    if ($a === "--color" && $i + 1 < $n && in_array($argv[$i + 1], ["auto", "always", "never"])) { return [2, "color", $argv[$i + 1]]; }
+    if ($a === "-v" || $a === "--verbose") { return [1, "verbose", true]; }
+    if ($a === "-q" || $a === "--quiet") { return [1, "quiet", true]; }
+    return [0, "", null];
+}
+
+func split($argv) {
+    $g = newGlobals();
+    $i = 0;
+    $n = count($argv);
+    while ($i < $n) {
+        $e = eatGlobal($argv, $i, $g);
+        if ($e[0] === 0) { break; }
+        $g[$e[1]] = $e[2];
+        $i += $e[0];
+    }
+    $cmd = $i < $n ? $argv[$i] : "";
+    if ($cmd === "-h" || $cmd === "--help") { $cmd = "help"; }
+    if ($cmd === "-V" || $cmd === "--version") { $cmd = "version"; }
+    $rest = $i < $n ? array_slice($argv, $i + 1) : [];
+    return ["global" => $g, "cmd" => $cmd, "rest" => $rest];
+}
+
+# wyciąga flagi globalne z dowolnego miejsca (przed `--`); zwraca ["args" => bez globalnych, "global" => [...]]
+func globalsIn($args, $g) {
+    $out = [];
+    $i = 0;
+    $n = count($args);
+    while ($i < $n) {
+        if ($args[$i] === "--") {
+            for (; $i < $n; $i++) { $out[] = $args[$i]; }
+            break;
+        }
+        $e = eatGlobal($args, $i, $g);
+        if ($e[0] === 0) { $out[] = $args[$i]; $i++; continue; }
+        $g[$e[1]] = $e[2];
+        $i += $e[0];
+    }
+    return ["args" => $out, "global" => $g];
+}
+
+func parse($argv, $valued = []) {
+    $r = ["pos" => [], "flags" => [], "rest" => []];
+    $n = count($argv);
+    for ($i = 0; $i < $n; $i++) {
+        $a = $argv[$i];
+        if ($a === "--") {
+            $r["rest"] = array_slice($argv, $i + 1);
+            break;
+        }
+        if (starts_with($a, "--") && index_of($a, "=") > 0) {
+            $eq = index_of($a, "=");
+            $r["flags"][substr($a, 0, $eq)] = substr($a, $eq + 1);
+            continue;
+        }
+        if (starts_with($a, "-") && strlen($a) > 1 && !isNumber($a)) {
+            if (in_array($a, $valued) && $i + 1 < $n) {
+                $r["flags"][$a] = $argv[$i + 1];
+                $i++;
+            } else {
+                $r["flags"][$a] = true;
+            }
+            continue;
+        }
+        $r["pos"][] = $a;
+    }
+    return $r;
+}
+
+# „-5” to liczba (argument pozycyjny), nie flaga
+func isNumber($a) {
+    if (strlen($a) < 2 || substr($a, 0, 1) !== "-") { return false; }
+    for ($i = 1; $i < strlen($a); $i++) { if (!is_digit(substr($a, $i, 1))) { return false; } }
+    return true;
+}
+
+func has($p, $name, $short = "") {
+    return has_key($p["flags"], $name) || ($short !== "" && has_key($p["flags"], $short));
+}
+
+func value($p, $name, $default = null, $short = "") {
+    if (has_key($p["flags"], $name)) {
+        $v = $p["flags"][$name];
+        return $v === true ? $default : $v;
+    }
+    if ($short !== "" && has_key($p["flags"], $short)) {
+        $v = $p["flags"][$short];
+        return $v === true ? $default : $v;
+    }
+    return $default;
+}
+
+func pos($p, $i, $default = null) { return $i < count($p["pos"]) ? $p["pos"][$i] : $default; }
