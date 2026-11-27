@@ -1,0 +1,211 @@
+namespace Ui;
+
+import Std.Os;
+import Workspace.Util;
+
+##
+ * Ui — kolory i elementy wizualne CLI/TUI: paski, ramki, tabele, komunikaty.
+ *
+ * Kolory włącza się/wyłącza tak (od najsilniejszego):
+ *   --color=always|never|auto (flaga globalna → LEGENDARY_COLOR), NO_COLOR, TERM=dumb, stdout nie jest terminalem.
+ * Wszystkie funkcje „rysujące” zwracają teksty/listy linii — wypisuje wołający (TUI składa z nich ramki).
+##
+
+func useColor() {
+    $m = Os.env("LEGENDARY_COLOR", "");
+    if ($m === "always") { return true; }
+    if ($m === "never") { return false; }
+    if (Os.env("NO_COLOR", "") !== "") { return false; }
+    if (Os.env("TERM", "dumb") === "dumb") { return false; }
+    return Util.isTty(1);
+}
+
+func paint($code, $text) {
+    if (!useColor()) { return $text; }
+    return chr(27) . "[" . $code . "m" . $text . chr(27) . "[0m";
+}
+
+func fg($n, $text) { return paint("38;5;" . $n, $text); }
+
+# ───────────────── paleta LegendaryOS ─────────────────
+func bold($t) { return paint("1", $t); }
+func dim($t) { return paint("2", $t); }
+func italic($t) { return paint("3", $t); }
+func underline($t) { return paint("4", $t); }
+func inverse($t) { return paint("7", $t); }
+func red($t) { return fg(203, $t); }
+func green($t) { return fg(78, $t); }
+func yellow($t) { return fg(221, $t); }
+func blue($t) { return fg(75, $t); }
+func magenta($t) { return fg(177, $t); }
+func cyan($t) { return fg(80, $t); }
+func gray($t) { return fg(244, $t); }
+func violet($t) { return fg(141, $t); }
+func gold($t) { return fg(220, $t); }
+func orange($t) { return fg(208, $t); }
+func title($t) { return paint("1;38;5;141", $t); }
+func accent($t) { return paint("1;38;5;220", $t); }
+func selected($t) { return paint("1;30;48;5;141", $t); }
+
+# ───────────────── długość widoczna / wyrównanie ─────────────────
+# liczba widocznych znaków (bez sekwencji ANSI; znaki Unicode liczone jako jeden)
+func vlen($s) {
+    $n = 0;
+    $in = false;
+    foreach (chars($s) as $c) {
+        if ($in) {
+            if ($c === "m" || $c === "H" || $c === "J" || $c === "K") { $in = false; }
+        } else if ($c === chr(27)) {
+            $in = true;
+        } else {
+            $n++;
+        }
+    }
+    return $n;
+}
+
+func spaces($n) { return $n > 0 ? repeat(" ", $n) : ""; }
+func padR($s, $w) { return $s . spaces($w - vlen($s)); }
+func padL($s, $w) { return spaces($w - vlen($s)) . $s; }
+func center($s, $w) {
+    $d = $w - vlen($s);
+    if ($d <= 0) { return $s; }
+    $l = intval(Math.floor($d / 2));
+    return spaces($l) . $s . spaces($d - $l);
+}
+
+# obcina do $w widocznych znaków (tekst bez kolorów!) i dodaje „…”
+func clip($s, $w) {
+    if ($w < 1) { return ""; }
+    $cs = chars($s);
+    if (count($cs) <= $w) { return $s; }
+    return join(array_slice($cs, 0, $w - 1), "") . "…";
+}
+
+# ───────────────── paski i wykresy ─────────────────
+func levelColor($pct) {
+    if ($pct <= 15) { return 203; }
+    if ($pct <= 35) { return 208; }
+    if ($pct <= 60) { return 221; }
+    return 78;
+}
+
+##
+ * Pasek postępu o szerokości $w. $marks — lista wartości (0-100) znaczonych kreską ┃ (np. progi ładowania).
+ * $color — numer koloru 256 albo null (wtedy zależnie od poziomu).
+##
+func bar($pct, $w, $marks = [], $color = null) {
+    $pct = Util.clamp(intval(Math.round($pct)), 0, 100);
+    $filled = intval(Math.round($pct * $w / 100));
+    $col = $color === null ? levelColor($pct) : $color;
+    $cells = [];
+    for ($i = 0; $i < $w; $i++) { $cells[] = $i < $filled ? 1 : 0; }
+    foreach ($marks as $m) {
+        $pos = Util.clamp(intval(Math.floor($m * $w / 100)), 0, $w - 1);
+        $cells[$pos] = 2;
+    }
+    $out = "";
+    $run = "";
+    $kind = -1;
+    foreach ($cells as $c) {
+        if ($c !== $kind && $run !== "") {
+            $out .= paintKind($kind, $run, $col);
+            $run = "";
+        }
+        $kind = $c;
+        $run .= $c === 2 ? "┃" : ($c === 1 ? "█" : "░");
+    }
+    if ($run !== "") { $out .= paintKind($kind, $run, $col); }
+    return $out;
+}
+
+func paintKind($kind, $text, $col) {
+    if ($kind === 1) { return fg($col, $text); }
+    if ($kind === 2) { return paint("1;38;5;220", $text); }
+    return fg(238, $text);
+}
+
+# miniwykres z listy liczb: ▁▂▃▄▅▆▇█
+func spark($values) {
+    if (count($values) === 0) { return ""; }
+    $lo = $values[0];
+    $hi = $values[0];
+    foreach ($values as $v) { if ($v < $lo) { $lo = $v; } if ($v > $hi) { $hi = $v; } }
+    $g = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    $out = "";
+    foreach ($values as $v) {
+        $i = $hi === $lo ? 3 : intval(Math.floor(($v - $lo) * 7 / ($hi - $lo)));
+        $out .= $g[Util.clamp($i, 0, 7)];
+    }
+    return violet($out);
+}
+
+# ───────────────── ramki i tabele ─────────────────
+# lista linii: ╭─ Tytuł ──╮ │ … │ ╰──╯ ; $minW — minimalna szerokość treści
+func box($titleText, $lines, $minW = 0) {
+    $w = $minW;
+    if (vlen($titleText) + 1 > $w) { $w = vlen($titleText) + 1; }
+    foreach ($lines as $l) { if (vlen($l) > $w) { $w = vlen($l); } }
+    $b = fg(97, "│");
+    $out = [];
+    $out[] = fg(97, "╭─ ") . title($titleText) . fg(97, " " . repeat("─", $w - vlen($titleText) - 1) . "╮");
+    foreach ($lines as $l) { $out[] = $b . " " . padR($l, $w) . " " . $b; }
+    $out[] = fg(97, "╰" . repeat("─", $w + 2) . "╯");
+    return $out;
+}
+
+func printLines($lines) {
+    foreach ($lines as $l) { echo $l; }
+    return null;
+}
+
+# tabela: nagłówki + wiersze (teksty, mogą mieć kolory); zwraca listę linii
+func table($headers, $rows, $indent = "  ") {
+    $w = [];
+    foreach ($headers as $i => $h) { $w[$i] = vlen($h); }
+    foreach ($rows as $r) { foreach ($r as $i => $c) { if (vlen(strval($c)) > $w[$i]) { $w[$i] = vlen(strval($c)); } } }
+    $out = [];
+    $h = [];
+    $sep = [];
+    foreach ($headers as $i => $t) { $h[] = bold(padR($t, $w[$i])); $sep[] = repeat("─", $w[$i]); }
+    $out[] = $indent . join($h, "  ");
+    $out[] = $indent . gray(join($sep, "──"));
+    foreach ($rows as $r) {
+        $cells = [];
+        foreach ($r as $i => $c) { $cells[] = padR(strval($c), $w[$i]); }
+        $out[] = $indent . join($cells, "  ");
+    }
+    return $out;
+}
+
+func kv($k, $v, $w = 16) { return "  " . dim(padR($k, $w)) . $v; }
+
+func section($t) { return "  " . accent($t); }
+
+func badge($text, $color) { return fg($color, "●") . " " . $text; }
+
+# ───────────────── logo ─────────────────
+func logo() {
+    return [
+        fg(99, "  ╦  ╔═╗╔═╗╔═╗╔╗╔╔╦╗╔═╗╦═╗╦ ╦"),
+        fg(141, "  ║  ║╣ ║ ╦║╣ ║║║ ║║╠═╣╠╦╝╚╦╝"),
+        fg(220, "  ╩═╝╚═╝╚═╝╚═╝╝╚╝═╩╝╩ ╩╩╚═ ╩ ")
+    ];
+}
+
+# ───────────────── komunikaty ─────────────────
+func quiet() { return Os.env("LEGENDARY_QUIET", "") === "1"; }
+func isVerbose() { return Os.env("LEGENDARY_VERBOSE", "") === "1"; }
+
+func ok($msg) { if (!quiet()) { echo green("✔") . " " . $msg; } return null; }
+func info($msg) { if (!quiet()) { echo blue("•") . " " . $msg; } return null; }
+func step($label, $msg) { if (!quiet()) { echo violet(padL($label, 12)) . " " . $msg; } return null; }
+func hint($msg) { if (!quiet()) { echo gray("  ↳ " . $msg); } return null; }
+func warn($msg) { eecho(yellow("!") . " " . $msg); return null; }
+func error($msg) { eecho(red("✘") . " " . $msg); return null; }
+func verbose($msg) { if (isVerbose()) { eecho(gray("  · " . $msg)); } return null; }
+
+func die($msg, $code = 1) {
+    error($msg);
+    Os.exit($code);
+}
