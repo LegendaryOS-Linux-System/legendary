@@ -1,0 +1,225 @@
+namespace Util;
+
+import Std.Os;
+import Std.Path;
+import Std.Time;
+
+##
+ * Util — małe, wspólne funkcje legendary: procesy, pliki, czas, liczby.
+ * Nazwy świadomie nie powtarzają wbudowanych (split/join/sort/...), bo nazwy modułowe je przesłaniają.
+##
+
+# ───────────────── tekst ─────────────────
+func sq($s) { return "'" . replace($s, "'", "'\\''") . "'"; }
+
+# linie tekstu bez \r (ostatnia pusta linia po końcowym \n jest pomijana)
+func lines($text) {
+    $out = [];
+    foreach (split($text, "\n") as $l) {
+        if (ends_with($l, "\r")) { $l = substr($l, 0, strlen($l) - 1); }
+        $out[] = $l;
+    }
+    if (count($out) > 0 && $out[count($out) - 1] === "") { $out = array_slice($out, 0, count($out) - 1); }
+    return $out;
+}
+
+# porównanie tekstów po kodach znaków: -1 / 0 / 1
+func cmp($a, $b) {
+    $la = strlen($a);
+    $lb = strlen($b);
+    $n = $la < $lb ? $la : $lb;
+    for ($i = 0; $i < $n; $i++) {
+        $x = ord(substr($a, $i, 1));
+        $y = ord(substr($b, $i, 1));
+        if ($x !== $y) { return $x < $y ? -1 : 1; }
+    }
+    if ($la === $lb) { return 0; }
+    return $la < $lb ? -1 : 1;
+}
+
+# nowa, posortowana lista tekstów (przez wstawianie — listy są małe)
+func sortStrings($list) {
+    $out = [];
+    foreach ($list as $x) {
+        $i = count($out);
+        $out[] = $x;
+        while ($i > 0 && cmp($out[$i - 1], $x) > 0) {
+            $out[$i] = $out[$i - 1];
+            $i--;
+        }
+        $out[$i] = $x;
+    }
+    return $out;
+}
+
+# lista słów rozdzielonych dowolnymi białymi znakami
+func words($s) {
+    $out = [];
+    foreach (split(replace(replace($s, "\t", " "), "\n", " "), " ") as $w) { if ($w !== "") { $out[] = $w; } }
+    return $out;
+}
+
+# ───────────────── liczby ─────────────────
+func isIntText($s) {
+    $s = trim(strval($s));
+    if ($s === "") { return false; }
+    $i = 0;
+    if (substr($s, 0, 1) === "-") { $i = 1; }
+    if ($i >= strlen($s)) { return false; }
+    for (; $i < strlen($s); $i++) { if (!is_digit(substr($s, $i, 1))) { return false; } }
+    return true;
+}
+
+func intOr($s, $default) {
+    if ($s === null) { return $default; }
+    $s = trim(strval($s));
+    return isIntText($s) ? intval($s) : $default;
+}
+
+func clamp($v, $lo, $hi) {
+    if ($v < $lo) { return $lo; }
+    if ($v > $hi) { return $hi; }
+    return $v;
+}
+
+# dzielenie całkowite z zaokrągleniem do najbliższej
+func divRound($a, $b) {
+    if ($b === 0) { return 0; }
+    return intval(Math.floor(($a * 2 + $b) / ($b * 2)));
+}
+
+# float → tekst z jednym miejscem po przecinku ("7.5", "12.0")
+func fixed1($x) {
+    $t = intval(Math.round($x * 10));
+    $neg = $t < 0;
+    if ($neg) { $t = -$t; }
+    $s = intval(Math.floor($t / 10)) . "." . ($t % 10);
+    return $neg ? "-" . $s : $s;
+}
+
+# sekundy → "2 h 15 min", "45 min", "30 s"
+func duration($sec) {
+    $sec = intval($sec);
+    if ($sec < 0) { $sec = 0; }
+    if ($sec < 60) { return $sec . " s"; }
+    $m = intval(Math.floor($sec / 60));
+    if ($m < 60) { return $m . " min"; }
+    $h = intval(Math.floor($m / 60));
+    $mm = $m % 60;
+    if ($h < 48) { return $mm === 0 ? $h . " h" : $h . " h " . $mm . " min"; }
+    $d = intval(Math.floor($h / 24));
+    return $d . " d " . ($h % 24) . " h";
+}
+
+# bajty → "1.5 GiB"
+func bytesText($n) {
+    $n = floatval($n);
+    $u = ["B", "KiB", "MiB", "GiB", "TiB"];
+    $i = 0;
+    while ($n >= 1024 && $i < 4) { $n = $n / 1024; $i++; }
+    return $i === 0 ? intval($n) . " B" : fixed1($n) . " " . $u[$i];
+}
+
+# minuty od północy → "07:30"
+func hhmm($minutes) {
+    $minutes = (($minutes % 1440) + 1440) % 1440;
+    return Time.pad(intval(Math.floor($minutes / 60)), 2) . ":" . Time.pad($minutes % 60, 2);
+}
+
+# "07:30" → minuty od północy albo null
+func parseHhmm($s) {
+    $s = trim(strval($s));
+    $i = index_of($s, ":");
+    if ($i < 1) { return null; }
+    $h = substr($s, 0, $i);
+    $m = substr($s, $i + 1);
+    if (!isIntText($h) || !isIntText($m)) { return null; }
+    $h = intval($h);
+    $m = intval($m);
+    if ($h < 0 || $h > 23 || $m < 0 || $m > 59) { return null; }
+    return $h * 60 + $m;
+}
+
+func nowSec() { return Time.nowSeconds(); }
+
+# dane czasu lokalnego: [ts, minutes, weekday (0 = niedziela), text]
+func clockNow() {
+    $ts = Time.nowSeconds();
+    $p = Time.local($ts);
+    return ["ts" => $ts, "minutes" => $p["hour"] * 60 + $p["minute"], "weekday" => Time.weekday($p),
+        "text" => Time.format($p, "%F %T")];
+}
+
+# ───────────────── procesy ─────────────────
+# Process.run, ale bez wyjątku: brak programu = status 127
+func run($cmd, $args = []) {
+    try { return Process.run($cmd, $args); }
+    catch (Exception $e) { return ["status" => 127, "stdout" => "", "stderr" => $e->getMessage()]; }
+}
+
+# stdout przyciętego polecenia albo null przy błędzie
+func capture($cmd, $args = []) {
+    $r = run($cmd, $args);
+    if ($r["status"] !== 0) { return null; }
+    return trim($r["stdout"]);
+}
+
+# uruchamia z dziedziczeniem strumieni; zwraca kod wyjścia
+func inherit($cmd, $args = []) {
+    if (Os.env("LEGENDARY_VERBOSE", "") === "1") { eecho("+ " . $cmd . " " . join($args, " ")); }
+    try { return Process.exec($cmd, $args); }
+    catch (Exception $e) { eecho($cmd . ": " . $e->getMessage()); return 127; }
+}
+
+func shell($line) { return run("/bin/sh", ["-c", $line]); }
+
+# czy stdout / stdin to terminal (wynik w pamięci podręcznej środowiska)
+func isTty($fd = 1) {
+    $key = "LEGENDARY_TTY" . $fd;
+    $c = Os.env($key, "");
+    if ($c !== "") { return $c === "1"; }
+    $ok = inherit("/bin/sh", ["-c", "test -t " . $fd]) === 0;
+    Os.setEnv($key, $ok ? "1" : "0");
+    return $ok;
+}
+
+func isRoot() {
+    $f = Os.env("LEGENDARY_FAKE_ROOT", "");
+    if ($f !== "") { return $f === "1"; }
+    return capture("id", ["-u"]) === "0";
+}
+
+# ───────────────── pliki ─────────────────
+func readOr($path, $default = "") {
+    try { if (Os.isFile($path)) { return Os.readFile($path); } }
+    catch (Exception $e) { return $default; }
+    return $default;
+}
+
+func readTrim($path) {
+    $t = readOr($path, null);
+    return $t === null ? null : trim($t);
+}
+
+func ensureDir($p) {
+    if (Os.isDir($p)) { return $p; }
+    $r = run("mkdir", ["-p", $p]);
+    if ($r["status"] !== 0) { throw new Exception("nie można utworzyć katalogu " . $p . ": " . trim($r["stderr"])); }
+    return $p;
+}
+
+# zapis atomowy: plik tymczasowy obok celu, potem rename
+func writeAtomic($p, $text) {
+    ensureDir(Path.dirname($p));
+    $tmp = $p . ".tmp" . Os.pid();
+    Os.writeFile($tmp, $text);
+    Os.rename($tmp, $p);
+    return $p;
+}
+
+func firstExisting($paths) {
+    foreach ($paths as $p) { if (Os.isFile($p)) { return $p; } }
+    return null;
+}
+
+func has($list, $x) { return in_array($x, $list); }
