@@ -1,0 +1,66 @@
+namespace Lpm;
+
+import Std.Os;
+import Workspace.Util;
+
+##
+ * Lpm — cienki wrapper na `lpm` (LegendaryOS Package Manager). legendary nie duplikuje jego logiki:
+ *   lpm tools path <nazwa>   → ścieżka pliku wykonywalnego narzędzia z /tools (montuje squashfs przy pierwszym użyciu)
+ *   lpm tools list           → "  nazwa  commit12  zamontowane|odmontowane"
+ *   lpm tools add|update|remove|add-all|mount-all
+ * To dokładnie to, co robił skrypt `legendary-tool` (`exe="$(lpm tools path "$name")"; exec "$exe" "$@"`).
+ * Zmienna LEGENDARY_LPM wskazuje inny plik wykonywalny (testy).
+##
+
+func bin() { return Os.env("LEGENDARY_LPM", "lpm"); }
+
+func available() {
+    $b = bin();
+    if (index_of($b, "/") >= 0) { return Os.isFile($b); }
+    return Os.which($b) !== null;
+}
+
+# ścieżka narzędzia albo null (brak lpm / nie zainstalowane)
+func toolPath($name) {
+    if (!available()) { return null; }
+    $r = Util.run(bin(), ["tools", "path", $name]);
+    if ($r["status"] !== 0) { return null; }
+    $ls = Util.lines($r["stdout"]);
+    for ($i = count($ls) - 1; $i >= 0; $i--) {
+        $l = trim($ls[$i]);
+        if ($l !== "") { return $l; }
+    }
+    return null;
+}
+
+# [["name", "commit", "mounted" => bool], ...]
+func toolList() {
+    if (!available()) { return []; }
+    $r = Util.run(bin(), ["tools", "list"]);
+    if ($r["status"] !== 0) { return []; }
+    $out = [];
+    foreach (Util.lines($r["stdout"]) as $l) {
+        $w = Util.words($l);
+        if (count($w) === 3 && ($w[2] === "zamontowane" || $w[2] === "odmontowane")) {
+            $out[] = ["name" => $w[0], "commit" => $w[1], "mounted" => $w[2] === "zamontowane"];
+        }
+    }
+    return $out;
+}
+
+func version() {
+    if (!available()) { return null; }
+    $v = Util.capture(bin(), ["version"]);
+    if ($v === null) { return null; }
+    $ls = Util.lines($v);
+    return count($ls) > 0 ? trim($ls[0]) : null;
+}
+
+# polecenie przekazywane z dziedziczeniem strumieni; zwraca kod wyjścia
+func passthrough($args) {
+    if (!available()) {
+        eecho("✘ nie znaleziono `" . bin() . "` w PATH — to narzędzie wymaga menedżera pakietów LegendaryOS (lpm)");
+        return 127;
+    }
+    return Util.inherit(bin(), $args);
+}
