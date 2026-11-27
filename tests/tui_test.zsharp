@@ -1,0 +1,52 @@
+import Std.Os;
+import Workspace.Tui;
+import Workspace.Util;
+
+# Test TUI na sztucznym sysfs (renderuje tylko zakładki zależne od sztucznego środowiska — nie Przegląd/Diagnostykę): akcje z klawiatury (profil, limit +/-, pełne ładowanie). Wynik: tests/tui_test.out.
+
+$tmp = "/tmp/legendary-test-tui";
+Os.removeAll($tmp);
+Os.mkdir($tmp);
+Os.setEnv("LEGENDARY_COLOR", "never");
+Os.setEnv("TZ", "UTC");
+Os.setEnv("LEGENDARY_TUI_SIZE", "80x30");
+Os.setEnv("LEGENDARY_SYSFS_ROOT", $tmp . "/ps");
+Os.setEnv("LEGENDARY_BATTERY_CONF", $tmp . "/battery.hk");
+Os.setEnv("LEGENDARY_RUN_DIR", $tmp . "/run");
+Os.setEnv("LEGENDARY_STATE_DIR", $tmp . "/state");
+Os.setEnv("LEGENDARY_ZENIT_DIRS", $tmp . "/zenit");
+Os.setEnv("LEGENDARY_TOOLS_CATALOG", $tmp . "/catalog.hk");
+Os.setEnv("LEGENDARY_LPM", $tmp . "/brak-lpm");
+
+func put($path, $text) { Util.ensureDir(Os.env("LEGENDARY_STATE_DIR") . "/.."); Os.writeFile($path, $text . "\n"); }
+Util.ensureDir($tmp . "/ps/BAT0");
+Util.ensureDir($tmp . "/ps/AC");
+Util.ensureDir($tmp . "/zenit");
+$b = $tmp . "/ps/BAT0/";
+foreach (["type" => "Battery", "status" => "Charging", "capacity" => "62", "energy_now" => "31000000", "energy_full" => "47000000",
+          "energy_full_design" => "52000000", "power_now" => "20000000", "cycle_count" => "214", "temp" => "345",
+          "charge_control_start_threshold" => "40", "charge_control_end_threshold" => "80"] as $k => $v) { put($b . $k, $v); }
+put($tmp . "/ps/AC/type", "Mains");
+put($tmp . "/ps/AC/online", "1");
+Os.writeFile($tmp . "/catalog.hk", "[tools]\n-> bit\n--> git => https://example.org/bit\n--> entry => bin/bit\n");
+Os.writeFile($tmp . "/zenit/legendary-battery.service", "[Unit]\nDescription=test\n[Install]\nWantedBy=multi-user.target\n");
+
+func thr() { $d = Os.env("LEGENDARY_SYSFS_ROOT") . "/BAT0/"; return trim(Os.readFile($d . "charge_control_start_threshold")) . "-" . trim(Os.readFile($d . "charge_control_end_threshold")); }
+
+echo "######## zakładka Bateria: Enter na 'smart', potem down+Enter ('full')";
+Os.setEnv("LEGENDARY_TUI_KEYS", "down,enter,q");
+Tui.cmd(["--tab", "bateria"]);
+echo "progi w sprzęcie: " . thr();
+
+echo "######## down, down, Enter (balanced) → +, +, -, f";
+Os.setEnv("LEGENDARY_TUI_KEYS", "down,down,enter,+,+,-,f,q");
+Tui.cmd(["--tab", "bateria"]);
+echo "progi w sprzęcie: " . thr();
+
+echo "######## --tab usługi, klawisz 4, ? (pomoc), nieznana zakładka";
+Os.setEnv("LEGENDARY_TUI_KEYS", "4,?,q");
+Tui.cmd(["--tab", "uslugi"]);
+echo Tui.cmd(["--tab", "xyz"]);
+echo "######## klawisze: dekodowanie";
+foreach (["1b5b41", "1b5b42", "1b5b43", "1b5b44", "0a", "09", "1b5b5a", "71", "2b", "1b", "7f", "ffff", "1b5b357e"] as $h) { echo $h . " → " . Tui.keyName($h); }
+Os.removeAll($tmp);
