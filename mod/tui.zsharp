@@ -1,0 +1,397 @@
+namespace Tui;
+
+import Std.Os;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Cli;
+import Workspace.Help;
+import Workspace.Lpm;
+import Workspace.Tools;
+import Workspace.Battery;
+import Workspace.Plan;
+import Workspace.Sysinfo;
+import Workspace.Services;
+import Workspace.Doctor;
+
+##
+ * Tui — `legendary show`: interfejs terminalowy z zakładkami (alternatywa dla CLI).
+ *
+ * Klawisze: ←/→/Tab/1-6 zakładki · ↑/↓ wybór · Enter akcja · r odśwież · ? pomoc · q wyjście.
+ * Bez bibliotek: tryb „raw” terminala obsługuje krótki skrypt sh (stty + dd), jeden odczyt = jeden klawisz.
+ *
+ * Testy/skrypty: LEGENDARY_TUI_KEYS="down,enter,q" podaje klawisze bez terminala, LEGENDARY_TUI_SIZE="80x24" ustala
+ * rozmiar; --static rysuje jedną ramkę. W tych trybach nie ma sekwencji sterujących kursorem.
+ * Stan jest przekazywany funkcyjnie (każdy handler zwraca nowy stan).
+##
+
+func tabs() {
+    return [["overview", "Przegląd"], ["tools", "Narzędzia"], ["battery", "Bateria"], ["services", "Usługi"], ["doctor", "Diagnostyka"], ["help", "Pomoc"]];
+}
+
+func tabIndex($name) {
+    $n = lower(trim($name));
+    $alias = ["przeglad" => "overview", "narzedzia" => "tools", "bateria" => "battery", "uslugi" => "services", "diagnostyka" => "doctor", "pomoc" => "help"];
+    if (has_key($alias, $n)) { $n = $alias[$n]; }
+    foreach (tabs() as $i => $t) { if ($t[0] === $n) { return $i; } }
+    return -1;
+}
+
+func esc() { return chr(27); }
+
+# ───────────────── terminal ─────────────────
+func size() {
+    $e = Os.env("LEGENDARY_TUI_SIZE", "");
+    if ($e !== "" && index_of($e, "x") > 0) {
+        $p = split($e, "x");
+        return [Util.intOr($p[0], 80), Util.intOr($p[1], 24)];
+    }
+    $r = Util.run("/bin/sh", ["-c", "stty size </dev/tty 2>/dev/null"]);
+    if ($r["status"] === 0) {
+        $w = Util.words($r["stdout"]);
+        if (count($w) === 2 && Util.isIntText($w[0]) && Util.isIntText($w[1])) { return [Util.clamp(intval($w[1]), 60, 160), Util.clamp(intval($w[0]), 18, 80)]; }
+    }
+    return [Util.clamp(Util.intOr(Os.env("COLUMNS", "80"), 80), 60, 160), Util.clamp(Util.intOr(Os.env("LINES", "24"), 24), 18, 80)];
+}
+
+func hexVal($c) { return index_of("0123456789abcdef", lower($c)); }
+
+func keyName($hex) {
+    $map = ["1b5b41" => "up", "1b5b42" => "down", "1b5b43" => "right", "1b5b44" => "left", "1b4f41" => "up", "1b4f42" => "down",
+        "1b4f43" => "right", "1b4f44" => "left", "1b5b48" => "home", "1b4f48" => "home", "1b5b317e" => "home", "1b5b46" => "end",
+        "1b4f46" => "end", "1b5b347e" => "end", "1b5b357e" => "pgup", "1b5b367e" => "pgdn", "0a" => "enter", "0d" => "enter",
+        "09" => "tab", "1b5b5a" => "btab", "20" => "space", "1b" => "esc", "03" => "q", "04" => "q", "7f" => "backspace", "08" => "backspace"];
+    if (has_key($map, $hex)) { return $map[$hex]; }
+    if (strlen($hex) === 2) {
+        $v = hexVal(substr($hex, 0, 1)) * 16 + hexVal(substr($hex, 1, 1));
+        if ($v >= 33 && $v <= 126) { return chr($v); }
+    }
+    return "";
+}
+
+func rawScript() {
+    return "old=$(stty -g 2>/dev/null); trap 'stty \"$old\" 2>/dev/null' EXIT; stty -icanon -echo -isig min 1 time 0 2>/dev/null; "
+        . "dd bs=8 count=1 2>/dev/null | od -An -v -tx1 | tr -d ' \\n' > \"$1\"";
+}
+
+# → ["key" => nazwa, "s" => stan]
+func nextKey($s) {
+    if ($s["scripted"]) {
+        if (count($s["script"]) === 0) { return ["key" => "q", "s" => $s]; }
+        $k = $s["script"][0];
+        $s["script"] = array_slice($s["script"], 1);
+        return ["key" => $k, "s" => $s];
+    }
+    Os.writeFile($s["keyfile"], "");
+    Util.inherit("/bin/sh", ["-c", rawScript(), "sh", $s["keyfile"]]);
+    $hex = trim(Util.readOr($s["keyfile"], ""));
+    return ["key" => $hex === "" ? "q" : keyName($hex), "s" => $s];
+}
+
+# ───────────────── widoki zakładek ─────────────────
+# lista linii z oknem przewijania wokół $sel (indeks linii) o wysokości $h
+func window($lines, $sel, $h) {
+    if (count($lines) <= $h) { return $lines; }
+    $top = Util.clamp($sel - intval(Math.floor($h / 2)), 0, count($lines) - $h);
+    return array_slice($lines, $top, $h);
+}
+
+func cursorLine($text, $on, $w) {
+    return $on ? Ui.selected(" ▶ " . Ui.padR($text, $w - 3) . " ") : "   " . $text . " ";
+}
+
+func plain($s) {
+    # tekst bez kolorów potrzebny do inwersji zaznaczenia
+    $out = "";
+    $in = false;
+    foreach (chars($s) as $c) {
+        if ($in) { if ($c === "m") { $in = false; } continue; }
+        if ($c === chr(27)) { $in = true; continue; }
+        $out .= $c;
+    }
+    return $out;
+}
+
+func viewOverview($s, $w, $h) {
+    $info = $s["data"]["overview"] ?? null;
+    if ($info === null) { $info = Sysinfo.collect(); }
+    return ["lines" => Sysinfo.lines($info, 24), "sel" => 0, "data" => $info];
+}
+
+func viewTools($s, $w, $h) {
+    $rows = $s["data"]["tools"] ?? null;
+    if ($rows === null) { $rows = Tools.rows(); }
+    $L = [];
+    if (count($rows) === 0) { $L[] = "  " . Ui.gray("brak narzędzi (katalog tools.hk / lpm tools list)"); return ["lines" => $L, "sel" => 0, "data" => $rows]; }
+    $sel = Util.clamp($s["sel"]["tools"] ?? 0, 0, count($rows) - 1);
+    $L[] = "  " . Ui.bold(Ui.padR("Narzędzie", 20)) . Ui.bold(Ui.padR("Stan", 18)) . Ui.bold("Commit");
+    foreach ($rows as $i => $r) {
+        $txt = Ui.padR($r["name"], 20) . Ui.padR($r["state"], 18) . ($r["commit"] === "" ? "-" : $r["commit"]);
+        $L[] = $i === $sel ? Ui.selected(" ▶ " . Ui.padR($txt, $w - 6) . " ") : "   " . Ui.padR($r["name"], 20) . Tools.colorState(Ui.padR($r["state"], 18)) . ($r["commit"] === "" ? "-" : $r["commit"]);
+    }
+    $L[] = "";
+    $r = $rows[$sel];
+    $L[] = "  " . Ui.dim("źródło: ") . ($r["git"] === "" ? "-" : Ui.clip($r["git"], $w - 14));
+    $L[] = "  " . Ui.dim($r["installed"] ? "Enter — uruchom · u — aktualizuj · r — odśwież" : "Enter / i — zainstaluj (wymaga roota) · r — odśwież");
+    return ["lines" => $L, "sel" => $sel + 1, "data" => $rows];
+}
+
+func viewBattery($s, $w, $h) {
+    $res = Battery.applyNow(["dry" => true]);
+    $L = [];
+    if (!$res["ok"] && !has_key($res, "snap")) {
+        $L[] = "  " . Ui.gray($res["error"]);
+        return ["lines" => $L, "sel" => 0, "data" => null];
+    }
+    $d = has_key($res, "decision") ? $res["decision"] : null;
+    foreach (Battery.statusLines($res["snap"], $d, 28) as $l) { $L[] = $l; }
+    $L[] = "";
+    $L[] = Ui.section("Profil ładowania");
+    $names = Plan.profileNames();
+    $sel = Util.clamp($s["sel"]["battery"] ?? 0, 0, count($names) - 1);
+    $cur = $d === null ? "" : $d["profile"];
+    $first = count($L);
+    foreach ($names as $i => $n) {
+        $info = $n === "smart" ? "adaptacyjny" : ($n === "custom" ? "własne progi" : Plan.profiles()[$n]["start"] . "–" . Plan.profiles()[$n]["end"] . " %");
+        $mark = $n === $cur ? Ui.green("●") : " ";
+        $L[] = $i === $sel ? Ui.selected(" ▶ " . ($n === $cur ? "● " : "  ") . Ui.padR($n, 12) . Ui.padR($info, 14) . " ") : "   " . $mark . " " . Ui.padR($n, 12) . Ui.dim($info);
+    }
+    $L[] = "";
+    $L[] = "  " . Ui.dim("Enter — ustaw profil · +/- — limit custom ±5 % · f — pełne ładowanie · a — zastosuj");
+    return ["lines" => $L, "sel" => $first + $sel, "data" => null];
+}
+
+func viewServices($s, $w, $h) {
+    $us = $s["data"]["services"] ?? null;
+    if ($us === null) { $us = Services.units(); }
+    $L = [];
+    if (count($us) === 0) { return ["lines" => ["  " . Ui.gray("nie znaleziono jednostek zenitd")], "sel" => 0, "data" => $us]; }
+    $sel = Util.clamp($s["sel"]["services"] ?? 0, 0, count($us) - 1);
+    foreach ($us as $i => $u) {
+        $st = count($u["enabled"]) > 0 ? "włączona" : "domyślna";
+        $txt = Ui.padR($u["name"], 30) . Ui.padR($st, 10) . Ui.clip($u["desc"], $w - 48);
+        $L[] = $i === $sel ? Ui.selected(" ▶ " . Ui.padR($txt, $w - 6) . " ") : "   " . Ui.padR($u["name"], 30) . (count($u["enabled"]) > 0 ? Ui.green(Ui.padR($st, 10)) : Ui.gray(Ui.padR($st, 10))) . Ui.dim(Ui.clip($u["desc"], $w - 48));
+    }
+    return ["lines" => $L, "sel" => $sel, "data" => $us];
+}
+
+func viewDoctor($s, $w, $h) {
+    $res = $s["data"]["doctor"] ?? null;
+    if ($res === null) { $res = Doctor.run(); }
+    return ["lines" => Doctor.lines($res), "sel" => 0, "data" => $res];
+}
+
+func viewHelp($s, $w, $h) {
+    $L = [Ui.section("Klawisze"), ""];
+    foreach ([["← → Tab 1–6", "zmiana zakładki"], ["↑ ↓", "wybór pozycji"], ["Enter", "akcja (uruchom narzędzie / ustaw profil)"],
+              ["i / u", "zainstaluj / zaktualizuj narzędzie (Narzędzia)"], ["+ / -", "limit custom ±5 % (Bateria)"],
+              ["f / a", "pełne ładowanie / zastosuj politykę (Bateria)"], ["r", "odśwież dane"], ["q / Esc", "wyjście"]] as $k) {
+        $L[] = "  " . Ui.violet(Ui.padR($k[0], 14)) . $k[1];
+    }
+    $L[] = "";
+    $L[] = "  " . Ui.dim("Zmiany baterii i instalacja narzędzi wymagają roota: sudo legendary show");
+    return ["lines" => $L, "sel" => 0, "data" => null];
+}
+
+func view($s, $w, $h) {
+    $t = tabs()[$s["tab"]][0];
+    if ($t === "overview") { return viewOverview($s, $w, $h); }
+    if ($t === "tools") { return viewTools($s, $w, $h); }
+    if ($t === "battery") { return viewBattery($s, $w, $h); }
+    if ($t === "services") { return viewServices($s, $w, $h); }
+    if ($t === "doctor") { return viewDoctor($s, $w, $h); }
+    return viewHelp($s, $w, $h);
+}
+
+# ───────────────── rysowanie ─────────────────
+# → ["lines" => ramka, "s" => stan z odświeżonym cache]
+func frame($s) {
+    $sz = size();
+    $w = $sz[0];
+    $h = $sz[1] - 6;
+    $v = view($s, $w, $h);
+    $s["data"][tabs()[$s["tab"]][0]] = $v["data"];
+    $L = [];
+    $L[] = " " . Ui.title("◆ LEGENDARY") . Ui.dim("  " . Help.version());
+    $t = [];
+    foreach (tabs() as $i => $tb) { $t[] = $i === $s["tab"] ? Ui.selected(" " . ($i + 1) . " " . $tb[1] . " ") : Ui.gray(" " . ($i + 1) . " " . $tb[1] . " "); }
+    $L[] = " " . join($t, "");
+    $L[] = " " . Ui.gray(repeat("─", $w - 2));
+    foreach (window($v["lines"], $v["sel"], $h) as $l) { $L[] = $l; }
+    while (count($L) < $sz[1] - 2) { $L[] = ""; }
+    $L[] = " " . Ui.gray(repeat("─", $w - 2));
+    $L[] = " " . ($s["msg"] !== "" ? Ui.yellow($s["msg"]) : Ui.dim("←→ zakładki · ↑↓ wybór · Enter akcja · r odśwież · ? pomoc · q wyjście"));
+    return ["lines" => $L, "s" => $s];
+}
+
+func draw($s, $key) {
+    $f = frame($s);
+    if ($s["plain"]) {
+        if ($key !== "") { echo "──── po klawiszu: " . $key . " ────"; }
+        Ui.printLines($f["lines"]);
+    } else {
+        $out = esc() . "[H";
+        foreach ($f["lines"] as $l) { $out .= $l . esc() . "[K\n"; }
+        necho($out . esc() . "[J");
+    }
+    return $f["s"];
+}
+
+# ───────────────── akcje ─────────────────
+func leave($s) { if (!$s["plain"]) { necho(esc() . "[?25h" . esc() . "[?1049l"); } return null; }
+func enter($s) { if (!$s["plain"]) { necho(esc() . "[?1049h" . esc() . "[?25l"); } return null; }
+
+func runExternal($s, $label, $cmdArgs) {
+    leave($s);
+    echo Ui.accent("▶ " . $label);
+    $code = Util.inherit($cmdArgs[0], array_slice($cmdArgs, 1));
+    if (!$s["plain"]) {
+        echo Ui.dim("\n[zakończono, kod " . $code . "] Enter — powrót do legendary");
+        read_line();
+    } else { echo "[zakończono, kod " . $code . "]"; }
+    enter($s);
+    $s["data"] = [];
+    $s["msg"] = $label . ": kod " . $code;
+    return $s;
+}
+
+func toolAction($s, $install) {
+    $rows = $s["data"]["tools"] ?? [];
+    if (count($rows) === 0) { return $s; }
+    $r = $rows[Util.clamp($s["sel"]["tools"] ?? 0, 0, count($rows) - 1)];
+    if ($r["installed"] && !$install) {
+        $exe = Lpm.toolPath($r["name"]);
+        if ($exe === null) { $s["msg"] = "nie można ustalić ścieżki " . $r["name"]; return $s; }
+        Os.setEnv("LEGENDARY_TOOL", $r["name"]);
+        return runExternal($s, $r["name"], [$exe]);
+    }
+    if (!Util.isRoot()) { $s["msg"] = "instalacja wymaga roota — uruchom: sudo legendary show"; return $s; }
+    return runExternal($s, "lpm tools add " . $r["name"], [Lpm.bin(), "tools", "add", $r["name"]]);
+}
+
+func batteryApplyMsg() {
+    $r = Battery.applyNow([]);
+    if (!$r["ok"]) { return $r["error"]; }
+    return ($r["changed"] ? "zapisano progi " : "bez zmian: ") . $r["decision"]["start"] . "–" . $r["decision"]["end"] . " % (" . $r["decision"]["mode"] . ")";
+}
+
+func actProfile($name) {
+    try { Battery.saveValues(["battery.profile" => $name]); return "profil " . $name . ": " . batteryApplyMsg(); }
+    catch (Exception $e) { return $e->getMessage(); }
+}
+
+func actCustom($end) {
+    try {
+        Battery.saveValues(["battery.profile" => "custom", "battery.end" => $end, "battery.start" => Util.clamp($end - 5, 0, 98)]);
+        return "custom " . $end . " %: " . batteryApplyMsg();
+    } catch (Exception $e) { return $e->getMessage(); }
+}
+
+func actFull() {
+    try {
+        $st = Battery.readState();
+        $st["override"] = "full";
+        if (!Battery.writeState($st)) { return "nie można zapisać stanu — potrzebny root (sudo legendary show)"; }
+        return "pełne ładowanie: " . batteryApplyMsg();
+    } catch (Exception $e) { return $e->getMessage(); }
+}
+
+func actApply() {
+    try { return batteryApplyMsg(); } catch (Exception $e) { return $e->getMessage(); }
+}
+
+func batteryAction($s, $key) {
+    $names = Plan.profileNames();
+    $sel = Util.clamp($s["sel"]["battery"] ?? 0, 0, count($names) - 1);
+    if ($key === "enter") { $s["msg"] = actProfile($names[$sel]); }
+    else if ($key === "+" || $key === "-" || $key === "=") {
+        $l = Battery.loadConfig();
+        $s["msg"] = actCustom(Util.clamp($l["cfg"]["battery.end"] + ($key === "-" ? -5 : 5), 20, 100));
+    }
+    else if ($key === "f") { $s["msg"] = actFull(); }
+    else if ($key === "a") { $s["msg"] = actApply(); }
+    return $s;
+}
+
+func move($s, $delta) {
+    $t = tabs()[$s["tab"]][0];
+    $s["sel"][$t] = max0(($s["sel"][$t] ?? 0) + $delta);
+    return $s;
+}
+func max0($n) { return $n < 0 ? 0 : $n; }
+
+func handle($s, $key) {
+    $s["msg"] = "";
+    $n = count(tabs());
+    $t = tabs()[$s["tab"]][0];
+    if ($key === "right" || $key === "tab" || $key === "l") { $s["tab"] = ($s["tab"] + 1) % $n; return $s; }
+    if ($key === "left" || $key === "btab" || $key === "h") { $s["tab"] = ($s["tab"] + $n - 1) % $n; return $s; }
+    if (Util.isIntText($key) && intval($key) >= 1 && intval($key) <= $n) { $s["tab"] = intval($key) - 1; return $s; }
+    if ($key === "?") { $s["tab"] = $n - 1; return $s; }
+    if ($key === "r") { $s["data"] = []; $s["msg"] = "odświeżono"; return $s; }
+    if ($key === "down" || $key === "j") { return move($s, 1); }
+    if ($key === "up" || $key === "k") { return move($s, -1); }
+    if ($key === "home") { $s["sel"][$t] = 0; return $s; }
+    if ($key === "end") { $s["sel"][$t] = 9999; return $s; }
+    if ($t === "tools") {
+        if ($key === "enter") { return toolAction($s, false); }
+        if ($key === "i") { return toolAction($s, true); }
+        if ($key === "u") {
+            $rows = $s["data"]["tools"] ?? [];
+            if (count($rows) > 0 && Util.isRoot()) { return runExternal($s, "lpm tools update", [Lpm.bin(), "tools", "update", $rows[Util.clamp($s["sel"]["tools"] ?? 0, 0, count($rows) - 1)]["name"]]); }
+            $s["msg"] = "aktualizacja wymaga roota — uruchom: sudo legendary show";
+            return $s;
+        }
+    }
+    if ($t === "battery") { return batteryAction($s, $key); }
+    return $s;
+}
+
+# ───────────────── wejście ─────────────────
+func cmd($args) {
+    $p = Cli.parse($args, ["--tab"]);
+    $tab = 0;
+    $want = Cli.value($p, "--tab", "");
+    if ($want !== "") {
+        $tab = tabIndex($want);
+        if ($tab < 0) { Ui.error("nieznana zakładka `" . $want . "` (przeglad, narzedzia, bateria, uslugi, diagnostyka, pomoc)"); return 2; }
+    }
+    $keys = Os.env("LEGENDARY_TUI_KEYS", "");
+    $scripted = $keys !== "";
+    $static = Cli.has($p, "--static") || (!$scripted && !Util.isTty(0));
+    $s = ["tab" => $tab, "sel" => [], "data" => [], "msg" => "", "scripted" => $scripted, "plain" => $scripted || $static,
+        "script" => $scripted ? split($keys, ",") : [], "keyfile" => ""];
+    if ($static && !$scripted) { draw($s, ""); return 0; }
+    if (!$scripted) {
+        if (!Util.isTty(1)) { Ui.error("`legendary show` potrzebuje terminala (albo użyj --static)"); return 1; }
+        $s["keyfile"] = Os.mkdtemp("legendary-tui-") . "/key";
+    }
+    enter($s);
+    $s = draw($s, "");
+    while (true) {
+        $k = nextKey($s);
+        $s = $k["s"];
+        if ($k["key"] === "q" || $k["key"] === "esc") { break; }
+        $s = handle($s, $k["key"]);
+        $s = draw($s, $k["key"]);
+    }
+    leave($s);
+    if ($s["keyfile"] !== "") { Os.removeAll(substr($s["keyfile"], 0, strlen($s["keyfile"]) - 4)); }
+    return 0;
+}
+
+# ───────────────── placeholder ─────────────────
+func interfaceCmd($args) {
+    $L = [];
+    $L[] = "";
+    $L[] = "  " . Ui.bold("Graficzny interfejs LegendaryOS") . Ui.dim("  (placeholder)");
+    $L[] = "";
+    $L[] = "  Docelowo: okno z tymi samymi funkcjami co CLI/TUI —";
+    $L[] = "  narzędzia, bateria, usługi i diagnostyka w jednym miejscu.";
+    $L[] = "";
+    $L[] = "  " . Ui.yellow("Jeszcze niezaimplementowany.") . " Na razie użyj:";
+    $L[] = "    " . Ui.violet("legendary show") . Ui.dim("      interfejs TUI");
+    $L[] = "    " . Ui.violet("legendary help") . Ui.dim("      lista poleceń CLI");
+    $L[] = "";
+    Ui.printLines(Ui.box("legendary interface", $L, 56));
+    return 0;
+}
