@@ -1,0 +1,186 @@
+namespace Hk;
+
+import Workspace.Util;
+
+##
+ * Hk — parser i zapis formatu .hk (ta sama gramatyka co hk-parser z bit/nula):
+ *   ! komentarz (tylko cała linia)        [sekcja]
+ *   -> klucz => wartość                   --> podklucz => wartość      ---> trzeci poziom
+ *   -> klucz                              (bez `=>`: otwiera mapę, wpisy `-->` należą do niej)
+ *   [a, b]  — tablica;  true/false — bool;  reszta — tekst (cudzysłowy są zdejmowane)
+ * Wynik parse: [sekcja => [klucz => wartość|lista|mapa]] z zachowaniem kolejności.
+ *
+ * setValue() zmienia jedną wartość w tekście BEZ gubienia komentarzy i układu pliku
+ * (używa go `legendary battery set`).
+##
+
+func fail($label, $line, $msg) { throw new Exception($label . ":" . $line . ": " . $msg); }
+
+func unquote($v) {
+    $v = trim($v);
+    $n = strlen($v);
+    if ($n >= 2) {
+        $a = substr($v, 0, 1);
+        $b = substr($v, $n - 1, 1);
+        if (($a === "\"" || $a === "'") && $a === $b) { return substr($v, 1, $n - 2); }
+    }
+    return $v;
+}
+
+func parseValue($raw) {
+    $v = trim($raw);
+    if (starts_with($v, "[") && ends_with($v, "]")) {
+        $inner = trim(substr($v, 1, strlen($v) - 2));
+        $out = [];
+        if ($inner === "") { return $out; }
+        foreach (split($inner, ",") as $p) { $out[] = unquote($p); }
+        return $out;
+    }
+    if ($v === "true") { return true; }
+    if ($v === "false") { return false; }
+    return unquote($v);
+}
+
+func parse($text, $label = "hk") {
+    $doc = [];
+    $sec = "";
+    $k1 = "";
+    $k2 = "";
+    $ls = Util.lines($text);
+    for ($i = 0; $i < count($ls); $i++) {
+        $l = trim($ls[$i]);
+        $no = $i + 1;
+        if ($l === "" || starts_with($l, "!")) { continue; }
+        if (starts_with($l, "[")) {
+            if (!ends_with($l, "]")) { fail($label, $no, "niedomknięty nagłówek sekcji"); }
+            $sec = trim(substr($l, 1, strlen($l) - 2));
+            if ($sec === "") { fail($label, $no, "pusta nazwa sekcji"); }
+            if (!has_key($doc, $sec)) { $doc[$sec] = []; }
+            $k1 = "";
+            $k2 = "";
+            continue;
+        }
+        if (!starts_with($l, "-")) { fail($label, $no, "oczekiwano `-> klucz => wartość` albo [sekcja]"); }
+        if ($sec === "") { fail($label, $no, "wpis poza sekcją"); }
+        $d = 0;
+        while ($d < strlen($l) && substr($l, $d, 1) === "-") { $d++; }
+        if (substr($l, $d, 1) !== ">") { fail($label, $no, "po myślnikach musi stać `>` (np. `-> klucz => wartość`)"); }
+        $rest = trim(substr($l, $d + 1));
+        $arrow = index_of($rest, "=>");
+        $key = $rest;
+        $val = [];
+        if ($arrow >= 0) {
+            $key = trim(substr($rest, 0, $arrow));
+            $val = parseValue(substr($rest, $arrow + 2));
+        }
+        if ($key === "") { fail($label, $no, "pusty klucz"); }
+        if ($d === 1) {
+            $doc[$sec][$key] = $val;
+            $k1 = $key;
+            $k2 = "";
+        } else if ($d === 2) {
+            if ($k1 === "") { fail($label, $no, "`-->` bez wpisu nadrzędnego `->`"); }
+            if (!is_array($doc[$sec][$k1])) { fail($label, $no, "klucz `" . $k1 . "` ma wartość — nie może być jednocześnie mapą"); }
+            $doc[$sec][$k1][$key] = $val;
+            $k2 = $key;
+        } else if ($d === 3) {
+            if ($k2 === "") { fail($label, $no, "`--->` bez wpisu nadrzędnego `-->`"); }
+            if (!is_array($doc[$sec][$k1][$k2])) { fail($label, $no, "klucz `" . $k2 . "` ma wartość — nie może być jednocześnie mapą"); }
+            $doc[$sec][$k1][$k2][$key] = $val;
+        } else {
+            fail($label, $no, "zbyt głębokie zagnieżdżenie (maks. `--->`)");
+        }
+    }
+    return $doc;
+}
+
+func section($doc, $sec) { return has_key($doc, $sec) ? $doc[$sec] : []; }
+
+func get($doc, $sec, $key, $default = null) {
+    if (has_key($doc, $sec) && has_key($doc[$sec], $key)) { return $doc[$sec][$key]; }
+    return $default;
+}
+
+# wartość jako lista (pojedynczy tekst → lista jednoelementowa; pusty → [])
+func asList($v) {
+    if ($v === null || $v === "") { return []; }
+    if (is_array($v)) { return $v; }
+    return [$v];
+}
+
+func scalarText($v) {
+    if ($v === true) { return "true"; }
+    if ($v === false) { return "false"; }
+    return strval($v);
+}
+
+func valueText($v) {
+    if (is_array($v)) {
+        $p = [];
+        foreach ($v as $x) { $p[] = scalarText($x); }
+        return "[" . join($p, ", ") . "]";
+    }
+    return scalarText($v);
+}
+
+# zmienia (albo dodaje) `-> $key => $value` w sekcji $sec, zachowując resztę tekstu
+func setValue($text, $sec, $key, $value) {
+    $ls = split($text, "\n");
+    if (count($ls) > 0 && $ls[count($ls) - 1] === "") { $ls = array_slice($ls, 0, count($ls) - 1); }
+    $newLine = "-> " . $key . " => " . valueText($value);
+    $secAt = -1;
+    for ($i = 0; $i < count($ls); $i++) {
+        if (trim($ls[$i]) === "[" . $sec . "]") { $secAt = $i; break; }
+    }
+    if ($secAt < 0) {
+        if (count($ls) > 0) { $ls[] = ""; }
+        $ls[] = "[" . $sec . "]";
+        $ls[] = $newLine;
+        return join($ls, "\n") . "\n";
+    }
+    $end = count($ls);
+    $lastEntry = $secAt;
+    for ($i = $secAt + 1; $i < count($ls); $i++) {
+        $t = trim($ls[$i]);
+        if (starts_with($t, "[")) { $end = $i; break; }
+        if ($t === "") { continue; }
+        if (!starts_with($t, "!")) { $lastEntry = $i; }
+        if (starts_with($t, "->") && !starts_with($t, "-->")) {
+            $rest = trim(substr($t, 2));
+            $arrow = index_of($rest, "=>");
+            $k = $arrow >= 0 ? trim(substr($rest, 0, $arrow)) : $rest;
+            if ($k === $key) { $ls[$i] = $newLine; return join($ls, "\n") . "\n"; }
+        }
+    }
+    $out = array_slice($ls, 0, $lastEntry + 1);
+    $out[] = $newLine;
+    foreach (array_slice($ls, $lastEntry + 1) as $x) { $out[] = $x; }
+    return join($out, "\n") . "\n";
+}
+
+func isList($a) {
+    $i = 0;
+    foreach ($a as $k => $v) {
+        if ($k !== $i) { return false; }
+        $i++;
+    }
+    return true;
+}
+
+# dokument → tekst .hk (do dwóch poziomów zagnieżdżenia)
+func encode($doc) {
+    $out = [];
+    foreach ($doc as $sec => $entries) {
+        if (count($out) > 0) { $out[] = ""; }
+        $out[] = "[" . $sec . "]";
+        foreach ($entries as $k => $v) {
+            if (is_array($v) && count($v) > 0 && !isList($v)) {
+                $out[] = "-> " . $k;
+                foreach ($v as $k2 => $v2) { $out[] = "--> " . $k2 . " => " . valueText($v2); }
+            } else {
+                $out[] = "-> " . $k . " => " . valueText($v);
+            }
+        }
+    }
+    return join($out, "\n") . "\n";
+}
