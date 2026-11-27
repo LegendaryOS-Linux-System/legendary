@@ -1,0 +1,638 @@
+namespace Battery;
+
+import Std.Os;
+import Std.Path;
+import Std.Json;
+import Std.Time;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Cli;
+import Workspace.Hk;
+import Workspace.Plan;
+
+##
+ * Battery — inteligentne ładowanie LegendaryOS (`legendary battery ...`).
+ *
+ * Sprzęt: /sys/class/power_supply/<BAT>/charge_control_{start,end}_threshold (jądro ≥ 5.4: ThinkPad, ASUS, Framework,
+ * Dell, Huawei, Samsung, LG, System76, ...) — progi ładowania zapisuje firmware, więc działają też przy wyłączonym laptopie.
+ * Decyzje podejmuje Plan.decide() (czysta logika); ten moduł zajmuje się odczytem, zapisem i wyglądem.
+ *
+ * Zmienne środowiska (głównie testy): LEGENDARY_SYSFS_ROOT, LEGENDARY_BATTERY_CONF, LEGENDARY_RUN_DIR, LEGENDARY_STATE_DIR.
+##
+
+# ───────────────── ścieżki ─────────────────
+func sysRoot() { return Os.env("LEGENDARY_SYSFS_ROOT", "/sys/class/power_supply"); }
+func runDir() { return Os.env("LEGENDARY_RUN_DIR", "/run/legendary"); }
+func dataDir() {
+    $e = Os.env("LEGENDARY_STATE_DIR", "");
+    if ($e !== "") { return $e; }
+    return Os.isDir("/state") ? "/state/legendary" : "/var/lib/legendary";
+}
+func statePath() { return runDir() . "/battery.state"; }
+func logPath() { return dataDir() . "/battery.csv"; }
+
+# kolejność odczytu konfiguracji (pierwszy istniejący wygrywa)
+func confSearch() {
+    $e = Os.env("LEGENDARY_BATTERY_CONF", "");
+    if ($e !== "") { return [$e]; }
+    return ["/state/etc/legendary/battery.hk", "/etc/legendary/battery.hk", "/usr/share/legendaryos/battery.hk", "/system/share/legendaryos/battery.hk"];
+}
+
+# gdzie zapisujemy zmiany
+func confWritePath() {
+    $e = Os.env("LEGENDARY_BATTERY_CONF", "");
+    if ($e !== "") { return $e; }
+    return Os.isDir("/state") ? "/state/etc/legendary/battery.hk" : "/etc/legendary/battery.hk";
+}
+
+# ───────────────── konfiguracja ─────────────────
+func template() {
+    $out = ["! LegendaryOS — inteligentne ładowanie baterii (legendary battery ...)", "! Zmieniaj przez `legendary battery set <klucz> <wartość>` albo edytuj ręcznie i uruchom `legendary battery apply`.", ""];
+    $cur = "";
+    foreach (Plan.schema() as $key => $s) {
+        $dot = index_of($key, ".");
+        $sec = substr($key, 0, $dot);
+        if ($sec !== $cur) {
+            if ($cur !== "") { $out[] = ""; }
+            $out[] = "[" . $sec . "]";
+            $cur = $sec;
+        }
+        $out[] = "! " . $s["help"];
+        $out[] = "-> " . substr($key, $dot + 1) . " => " . Hk.valueText($s["default"]);
+    }
+    return join($out, "\n") . "\n";
+}
+
+# ["cfg", "problems", "path" (null = domyślne)]
+func loadConfig() {
+    $path = Util.firstExisting(confSearch());
+    if ($path === null) { return ["cfg" => Plan.defaults(), "problems" => [], "path" => null]; }
+    $doc = Hk.parse(Os.readFile($path), $path);
+    $r = Plan.fromDoc($doc);
+    return ["cfg" => $r["cfg"], "problems" => $r["problems"], "path" => $path];
+}
+
+func saveValues($pairs) {
+    $path = confWritePath();
+    $text = Os.isFile($path) ? Os.readFile($path) : template();
+    foreach ($pairs as $key => $value) {
+        $dot = index_of($key, ".");
+        $text = Hk.setValue($text, substr($key, 0, $dot), substr($key, $dot + 1), $value);
+    }
+    try { Util.writeAtomic($path, $text); }
+    catch (Exception $e) { throw new Exception("nie można zapisać " . $path . " (" . $e->getMessage() . ") — uruchom z uprawnieniami roota: sudo legendary battery ..."); }
+    return $path;
+}
+
+# ───────────────── sysfs ─────────────────
+func attr($dev, $name) { return Util.readTrim(sysRoot() . "/" . $dev . "/" . $name); }
+
+func devices() {
+    $root = sysRoot();
+    if (!Os.isDir($root)) { return []; }
+    $out = [];
+    foreach (Util.sortStrings(Os.list($root)) as $d) {
+        if (attr($d, "type") === "Battery" && attr($d, "scope") !== "Device") { $out[] = $d; }
+    }
+    return $out;
+}
+
+func pickDevice($want) {
+    $all = devices();
+    if (count($all) === 0) { return null; }
+    if ($want !== "auto" && $want !== "" && in_array($want, $all)) { return $want; }
+    return $all[0];
+}
+
+func acOnline() {
+    $root = sysRoot();
+    if (!Os.isDir($root)) { return false; }
+    foreach (Os.list($root) as $d) {
+        $t = attr($d, "type");
+        if ($t !== null && $t !== "Battery" && attr($d, "online") === "1") { return true; }
+    }
+    return false;
+}
+
+func firstFile($dev, $names) {
+    foreach ($names as $n) { if (Os.isFile(sysRoot() . "/" . $dev . "/" . $n)) { return $n; } }
+    return null;
+}
+
+# które pliki sterujące udostępnia sprzęt
+func caps($dev) {
+    return [
+        "start" => firstFile($dev, ["charge_control_start_threshold", "charge_start_threshold"]),
+        "end" => firstFile($dev, ["charge_control_end_threshold", "charge_stop_threshold"]),
+        "behaviour" => firstFile($dev, ["charge_behaviour"])
+    ];
+}
+
+func numAttr($dev, $name) { return Util.intOr(attr($dev, $name), null); }
+
+##
+ * Migawka stanu baterii. Energia w µWh, moc w µW (urządzenia „charge_*” są przeliczane przez napięcie).
+##
+func snapshot($dev) {
+    $c = caps($dev);
+    $vmin = numAttr($dev, "voltage_min_design");
+    $vnow = numAttr($dev, "voltage_now");
+    $v = $vmin !== null ? $vmin : $vnow;
+    $e = [];
+    foreach (["now", "full", "full_design"] as $k) {
+        $val = numAttr($dev, "energy_" . $k);
+        if ($val === null) {
+            $ch = numAttr($dev, "charge_" . $k);
+            if ($ch !== null && $v !== null) { $val = intval(Math.floor($ch * $v / 1000000)); }
+        }
+        $e[$k] = $val;
+    }
+    $p = numAttr($dev, "power_now");
+    if ($p === null) {
+        $cur = numAttr($dev, "current_now");
+        if ($cur !== null && $vnow !== null) { $p = intval(Math.floor(Math.abs($cur) * $vnow / 1000000)); }
+    }
+    if ($p !== null && $p < 0) { $p = -$p; }
+    $cap = numAttr($dev, "capacity");
+    if ($cap === null && $e["now"] !== null && $e["full"] !== null && $e["full"] > 0) { $cap = intval(Math.round($e["now"] * 100 / $e["full"])); }
+    $t = numAttr($dev, "temp");
+    return [
+        "dev" => $dev,
+        "capacity" => $cap === null ? 0 : $cap,
+        "status" => attr($dev, "status") ?? "Unknown",
+        "ac" => acOnline(),
+        "powerUw" => $p,
+        "energyNow" => $e["now"], "energyFull" => $e["full"], "energyDesign" => $e["full_design"],
+        "temp" => $t === null ? null : $t / 10,
+        "cycles" => numAttr($dev, "cycle_count"),
+        "technology" => attr($dev, "technology"),
+        "manufacturer" => attr($dev, "manufacturer"),
+        "model" => attr($dev, "model_name"),
+        "startThr" => $c["start"] === null ? null : numAttr($dev, $c["start"]),
+        "endThr" => $c["end"] === null ? null : numAttr($dev, $c["end"]),
+        "behaviour" => $c["behaviour"] === null ? null : attr($dev, $c["behaviour"]),
+        "caps" => $c,
+        "acSince" => null, "override" => ""
+    ];
+}
+
+# ["dev", "snap"] albo null, gdy brak baterii
+func current($cfg = null) {
+    $want = $cfg === null ? "auto" : $cfg["battery.device"];
+    $dev = pickDevice($want);
+    if ($dev === null) { return null; }
+    return ["dev" => $dev, "snap" => snapshot($dev)];
+}
+
+# ───────────────── stan w /run (od kiedy zasilacz, jednorazowe pełne ładowanie) ─────────────────
+func readState() {
+    $t = Util.readOr(statePath(), "");
+    $st = ["ac_since" => null, "override" => ""];
+    if ($t === "") { return $st; }
+    try {
+        $d = Hk.parse($t, statePath());
+        $a = Hk.get($d, "state", "ac_since", "");
+        $st["ac_since"] = Util.isIntText($a) ? intval($a) : null;
+        $st["override"] = Hk.get($d, "state", "override", "");
+    } catch (Exception $e) { return $st; }
+    return $st;
+}
+
+func writeState($st) {
+    $doc = ["state" => ["ac_since" => $st["ac_since"] === null ? "" : $st["ac_since"], "override" => $st["override"]]];
+    try { Util.writeAtomic(statePath(), "! legendary battery — stan tymczasowy (/run)\n" . Hk.encode($doc)); return true; }
+    catch (Exception $e) { return false; }
+}
+
+# czysta: nowy stan na podstawie zasilacza/poziomu (override wygasa po odłączeniu zasilacza albo przy 100 %)
+func nextState($st, $ac, $cap, $status, $ts) {
+    $n = ["ac_since" => $st["ac_since"], "override" => $st["override"]];
+    if ($ac) { if ($n["ac_since"] === null) { $n["ac_since"] = $ts; } }
+    else { $n["ac_since"] = null; $n["override"] = ""; }
+    if ($n["override"] === "full" && ($cap >= 100 || $status === "Full")) { $n["override"] = ""; }
+    return $n;
+}
+
+# ───────────────── zapis progów ─────────────────
+func hwWrite($dev, $file, $value) {
+    $p = sysRoot() . "/" . $dev . "/" . $file;
+    try { Os.writeFile($p, strval($value) . "\n"); }
+    catch (Exception $e) { throw new Exception("zapis do " . $p . " nie powiódł się: " . $e->getMessage() . " (potrzebny root: sudo legendary battery apply)"); }
+    return null;
+}
+
+# Kolejność zapisu dobrana tak, by firmware nigdy nie zobaczył start >= end:
+# podnosimy koniec → najpierw koniec; obniżamy koniec → najpierw start.
+func writeThresholds($dev, $c, $curStart, $curEnd, $start, $end) {
+    $endFirst = $curEnd === null || $end >= $curEnd;
+    if ($endFirst) {
+        hwWrite($dev, $c["end"], $end);
+        if ($c["start"] !== null) { hwWrite($dev, $c["start"], $start); }
+    } else {
+        if ($c["start"] !== null) { hwWrite($dev, $c["start"], $start); }
+        hwWrite($dev, $c["end"], $end);
+    }
+    return null;
+}
+
+##
+ * Jedno przejście polityki: odczyt → decyzja → (zapis, jeśli trzeba). $opts: ["dry" => bool, "track" => bool (zapis stanu /run)]
+ * Wynik: ["ok", "error"?, "dev", "snap", "decision", "changed", "before" => [start, end], "problems"]
+##
+func applyNow($opts = []) {
+    $dry = has_key($opts, "dry") && $opts["dry"];
+    $track = !has_key($opts, "track") || $opts["track"];
+    $l = loadConfig();
+    $cur = current($l["cfg"]);
+    if ($cur === null) { return ["ok" => false, "error" => "nie wykryto baterii w " . sysRoot() . " (komputer stacjonarny albo maszyna wirtualna)", "problems" => $l["problems"]]; }
+    $snap = $cur["snap"];
+    if ($snap["caps"]["end"] === null) {
+        return ["ok" => false, "dev" => $cur["dev"], "snap" => $snap, "problems" => $l["problems"],
+            "error" => "sprzęt nie udostępnia progów ładowania (brak charge_control_end_threshold dla " . $cur["dev"] . ") — profil nie zadziała, ale `legendary battery status` nadal pokazuje stan"];
+    }
+    $clock = Util.clockNow();
+    $st = nextState(readState(), $snap["ac"], $snap["capacity"], $snap["status"], $clock["ts"]);
+    if ($track && !$dry) { writeState($st); }
+    $snap["acSince"] = $st["ac_since"];
+    $snap["override"] = $st["override"];
+    $d = Plan.decide($l["cfg"], $snap, $clock);
+    $changed = $d["end"] !== $snap["endThr"] || ($snap["caps"]["start"] !== null && $d["start"] !== $snap["startThr"]);
+    if ($changed && !$dry) { writeThresholds($cur["dev"], $snap["caps"], $snap["startThr"], $snap["endThr"], $d["start"], $d["end"]); }
+    return ["ok" => true, "dev" => $cur["dev"], "snap" => $snap, "decision" => $d, "changed" => $changed,
+        "before" => [$snap["startThr"], $snap["endThr"]], "problems" => $l["problems"], "clock" => $clock];
+}
+
+# ───────────────── widok ─────────────────
+func statusText($s) {
+    if ($s === "Charging") { return Ui.green("ładuje się"); }
+    if ($s === "Discharging") { return Ui.orange("rozładowuje się"); }
+    if ($s === "Full") { return Ui.green("pełna"); }
+    if ($s === "Not charging") { return Ui.blue("nie ładuje (limit osiągnięty)"); }
+    return Ui.gray($s);
+}
+
+func whText($uwh) { return $uwh === null ? "?" : Util.fixed1($uwh / 1000000) . " Wh"; }
+
+func limitsText($s, $e) {
+    if ($e === null) { return Ui.gray("niedostępne w tym sprzęcie"); }
+    return $s === null ? "koniec " . Ui.gold($e . " %") : "start " . Ui.gold($s . " %") . "   koniec " . Ui.gold($e . " %");
+}
+
+# linie wnętrza ramki „Bateria”; $res — wynik applyNow(dry) albo null
+func statusLines($snap, $d, $width = 30) {
+    $marks = [];
+    if ($snap["endThr"] !== null) { $marks[] = $snap["endThr"]; }
+    if ($snap["startThr"] !== null && $snap["startThr"] > 0) { $marks[] = $snap["startThr"]; }
+    $L = [];
+    $L[] = "  " . Ui.bar($snap["capacity"], $width, $marks) . "  " . Ui.bold($snap["capacity"] . " %");
+    $L[] = "";
+    $L[] = Ui.kv("Stan", statusText($snap["status"]) . Ui.dim("  ·  zasilacz: ") . ($snap["ac"] ? Ui.green("tak") : Ui.gray("nie")));
+    if ($snap["powerUw"] !== null && $snap["powerUw"] > 0) {
+        $eta = Plan.etaSeconds($snap);
+        $etaText = $eta === null ? "" : ($snap["status"] === "Charging" ? "  ·  do pełna: " . Util.duration($eta) : "  ·  do końca: " . Util.duration($eta));
+        $L[] = Ui.kv("Moc", Util.fixed1($snap["powerUw"] / 1000000) . " W" . Ui.dim($etaText));
+    }
+    $h = Plan.healthPct($snap);
+    if ($h !== null) {
+        $hc = $h >= 80 ? Ui.green($h . " %") : ($h >= 60 ? Ui.yellow($h . " %") : Ui.red($h . " %"));
+        $L[] = Ui.kv("Zdrowie ogniw", $hc . Ui.dim("  (" . whText($snap["energyFull"]) . " z " . whText($snap["energyDesign"]) . ")"));
+    }
+    if ($snap["cycles"] !== null) { $L[] = Ui.kv("Cykle", strval($snap["cycles"])); }
+    if ($snap["temp"] !== null) { $L[] = Ui.kv("Temperatura", Util.fixed1($snap["temp"]) . " °C"); }
+    $L[] = Ui.kv("Progi (sprzęt)", limitsText($snap["startThr"], $snap["endThr"]));
+    if ($d !== null) {
+        $modeText = $d["mode"] === $d["profile"] ? "" : Ui.dim("  →  ") . $d["mode"];
+        $L[] = Ui.kv("Profil", Ui.violet($d["profile"]) . $modeText . "  " . limitsText($snap["caps"]["start"] === null ? null : $d["start"], $d["end"]));
+        if ($snap["endThr"] !== null && ($d["end"] !== $snap["endThr"] || ($snap["startThr"] !== null && $d["start"] !== $snap["startThr"]))) {
+            $L[] = Ui.kv("", Ui.yellow("⚠ niezgodne ze sprzętem: sudo legendary battery apply"));
+        }
+        foreach ($d["reasons"] as $r) { $L[] = Ui.kv("", Ui.dim("• " . $r)); }
+    }
+    return $L;
+}
+
+func jsonStatus($res) {
+    $o = ["device" => $res["dev"], "battery" => $res["snap"]];
+    if (has_key($res, "decision")) { $o["policy"] = $res["decision"]; }
+    return Json.encodePretty($o);
+}
+
+# ───────────────── historia ─────────────────
+func csvHeader() { return "ts,capacity,status,power_w,health,temp_c,start,end,mode"; }
+
+func logLine($res) {
+    $s = $res["snap"];
+    $d = $res["decision"];
+    $p = $s["powerUw"] === null ? "" : Util.fixed1($s["powerUw"] / 1000000);
+    $h = Plan.healthPct($s);
+    return join([$res["clock"]["ts"], $s["capacity"], replace($s["status"], " ", "_"), $p, $h === null ? "" : $h,
+        $s["temp"] === null ? "" : Util.fixed1($s["temp"]), $d["start"], $d["end"], $d["mode"]], ",");
+}
+
+func appendLog($line) {
+    $p = logPath();
+    try {
+        Util.ensureDir(Path.dirname($p));
+        if (!Os.isFile($p)) { Os.writeFile($p, csvHeader() . "\n"); }
+        Os.appendFile($p, $line . "\n");
+        if (Os.size($p) > 262144) {
+            $ls = Util.lines(Os.readFile($p));
+            $keep = array_slice($ls, count($ls) - 1500);
+            Os.writeFile($p, csvHeader() . "\n" . join($keep, "\n") . "\n");
+        }
+    } catch (Exception $e) { Ui.verbose("log: " . $e->getMessage()); }
+    return null;
+}
+
+func readLog($n) {
+    $ls = Util.lines(Util.readOr(logPath(), ""));
+    $rows = [];
+    foreach ($ls as $i => $l) {
+        if ($i === 0 && starts_with($l, "ts,")) { continue; }
+        $c = split($l, ",");
+        if (count($c) >= 9) { $rows[] = $c; }
+    }
+    return count($rows) > $n ? array_slice($rows, count($rows) - $n) : $rows;
+}
+
+# ───────────────── polecenia ─────────────────
+func fail($msg, $hintText = "") {
+    Ui.error($msg);
+    if ($hintText !== "") { Ui.hint($hintText); }
+    return 1;
+}
+
+func printProblems($problems) { foreach ($problems as $p) { Ui.warn($p); } return null; }
+
+func cmdStatus($p) {
+    $res = applyNow(["dry" => true]);
+    if (!$res["ok"] && !has_key($res, "snap")) { return fail($res["error"]); }
+    if (Cli.has($p, "--json")) { echo jsonStatus($res); return 0; }
+    printProblems($res["problems"]);
+    $d = has_key($res, "decision") ? $res["decision"] : null;
+    Ui.printLines(Ui.box("Bateria · " . $res["dev"], statusLines($res["snap"], $d), 56));
+    if (!$res["ok"]) { Ui.warn($res["error"]); }
+    return 0;
+}
+
+func cmdApply($p) {
+    $dry = Cli.has($p, "--dry-run", "-n");
+    $res = applyNow(["dry" => $dry]);
+    if (!$res["ok"]) { return fail($res["error"]); }
+    printProblems($res["problems"]);
+    $d = $res["decision"];
+    $was = $res["before"][1] === null ? "?" : ($res["before"][0] === null ? "" : $res["before"][0] . "–") . $res["before"][1] . " %";
+    $now = $res["snap"]["caps"]["start"] === null ? $d["end"] . " %" : $d["start"] . "–" . $d["end"] . " %";
+    if ($res["changed"]) {
+        Ui.ok(($dry ? "[dry-run] zapisałbym progi: " : "progi zapisane: ") . Ui.gold($now) . Ui.dim("  (było " . $was . ")  ") . $res["dev"]);
+    } else {
+        Ui.ok("progi bez zmian: " . Ui.gold($now) . Ui.dim("  [" . $d["mode"] . "]  ") . $res["dev"]);
+    }
+    foreach ($d["reasons"] as $r) { Ui.hint($r); }
+    return 0;
+}
+
+# zapisuje konfigurację i (o ile nie --no-apply) od razu stosuje
+func persistAndApply($pairs, $p) {
+    $path = saveValues($pairs);
+    Ui.ok("zapisano " . Ui.dim($path));
+    if (Cli.has($p, "--no-apply")) { return 0; }
+    return cmdApply(["flags" => [], "pos" => [], "rest" => []]);
+}
+
+func cmdLimit($p) {
+    $a = Cli.pos($p, 0);
+    $b = Cli.pos($p, 1);
+    if ($a === null) { return fail("użycie: legendary battery limit <koniec> | <start> <koniec>", "np. `legendary battery limit 80` albo `legendary battery limit 40 80`"); }
+    $start = null;
+    $end = null;
+    if ($b === null) { $end = $a; } else { $start = $a; $end = $b; }
+    $ve = Plan.validate("battery.end", $end);
+    if (!$ve[0]) { return fail($ve[1]); }
+    $s = $start === null ? Util.clamp($ve[1] - 5, 0, 98) : null;
+    if ($start !== null) {
+        $vs = Plan.validate("battery.start", $start);
+        if (!$vs[0]) { return fail($vs[1]); }
+        $s = $vs[1];
+    }
+    if ($s >= $ve[1]) { return fail("próg startu (" . $s . " %) musi być niższy niż próg końca (" . $ve[1] . " %)"); }
+    return persistAndApply(["battery.profile" => "custom", "battery.start" => $s, "battery.end" => $ve[1]], $p);
+}
+
+func cmdProfile($p) {
+    $name = Cli.pos($p, 0);
+    $l = loadConfig();
+    $cfg = $l["cfg"];
+    if ($name === null) {
+        $rows = [];
+        $all = Plan.profiles();
+        $rows[] = [$cfg["battery.profile"] === "smart" ? Ui.green("●") : " ", Ui.bold("smart"), "adaptacyjny", "dock, plan „pełna przed X”, temperatura"];
+        foreach ($all as $n => $pr) {
+            $rows[] = [$cfg["battery.profile"] === $n ? Ui.green("●") : " ", Ui.bold($n), $pr["start"] . "–" . $pr["end"] . " %", $pr["label"]];
+        }
+        $rows[] = [$cfg["battery.profile"] === "custom" ? Ui.green("●") : " ", Ui.bold("custom"), $cfg["battery.start"] . "–" . $cfg["battery.end"] . " %", "własne progi (legendary battery limit ...)"];
+        Ui.printLines(Ui.table(["", "Profil", "Progi", "Opis"], $rows));
+        return 0;
+    }
+    $v = Plan.validate("battery.profile", $name);
+    if (!$v[0]) { return fail($v[1]); }
+    return persistAndApply(["battery.profile" => $v[1]], $p);
+}
+
+func cmdSet($p) {
+    $k = Cli.pos($p, 0);
+    $v = Cli.pos($p, 1);
+    if ($k === null || $v === null) { return fail("użycie: legendary battery set <klucz> <wartość>", "lista kluczy: legendary battery config --keys"); }
+    if (!has_key(Plan.schema(), $k) && has_key(Plan.schema(), "battery." . $k)) { $k = "battery." . $k; }
+    $r = Plan.validate($k, $v);
+    if (!$r[0]) { return fail($r[1]); }
+    return persistAndApply([$k => $r[1]], $p);
+}
+
+func cmdGet($p) {
+    $k = Cli.pos($p, 0);
+    if ($k === null) { return fail("użycie: legendary battery get <klucz>"); }
+    if (!has_key(Plan.schema(), $k) && has_key(Plan.schema(), "battery." . $k)) { $k = "battery." . $k; }
+    if (!has_key(Plan.schema(), $k)) { return fail("nieznany klucz `" . $k . "`"); }
+    $l = loadConfig();
+    echo Hk.valueText($l["cfg"][$k]);
+    return 0;
+}
+
+func cmdConfig($p) {
+    if (Cli.has($p, "--keys")) {
+        $rows = [];
+        foreach (Plan.schema() as $k => $s) { $rows[] = [Ui.bold($k), Hk.valueText($s["default"]), $s["help"]]; }
+        Ui.printLines(Ui.table(["Klucz", "Domyślnie", "Opis"], $rows));
+        return 0;
+    }
+    $l = loadConfig();
+    if (Cli.has($p, "--path")) { echo $l["path"] === null ? confWritePath() : $l["path"]; return 0; }
+    printProblems($l["problems"]);
+    $rows = [];
+    foreach ($l["cfg"] as $k => $v) {
+        $def = Plan.schema()[$k]["default"];
+        $changed = Hk.valueText($v) !== Hk.valueText($def);
+        $rows[] = [Ui.bold($k), $changed ? Ui.gold(Hk.valueText($v)) : Hk.valueText($v), $changed ? Ui.dim("zmienione (domyślnie " . Hk.valueText($def) . ")") : Ui.dim("domyślne")];
+    }
+    Ui.info("plik: " . ($l["path"] === null ? Ui.gray("(brak — wartości domyślne; zapis trafi do " . confWritePath() . ")") : $l["path"]));
+    Ui.printLines(Ui.table(["Klucz", "Wartość", ""], $rows));
+    return 0;
+}
+
+func cmdReset($p) {
+    $path = confWritePath();
+    if (!Os.isFile($path)) { Ui.ok("brak własnej konfiguracji — już obowiązują ustawienia domyślne"); return 0; }
+    try { Os.remove($path); }
+    catch (Exception $e) { return fail("nie można usunąć " . $path . ": " . $e->getMessage(), "uruchom jako root: sudo legendary battery reset"); }
+    Ui.ok("usunięto " . $path . " — przywrócono ustawienia domyślne");
+    if (Cli.has($p, "--no-apply")) { return 0; }
+    return cmdApply(["flags" => [], "pos" => [], "rest" => []]);
+}
+
+func cmdFull($p) {
+    $st = readState();
+    if (Cli.has($p, "--off")) {
+        $st["override"] = "";
+        if (!writeState($st)) { return fail("nie można zapisać stanu w " . statePath(), "uruchom jako root: sudo legendary battery full --off"); }
+        Ui.ok("jednorazowe pełne ładowanie wyłączone");
+        return cmdApply(["flags" => [], "pos" => [], "rest" => []]);
+    }
+    $cur = current();
+    if ($cur === null) { return fail("nie wykryto baterii"); }
+    $st["override"] = "full";
+    if ($st["ac_since"] === null && $cur["snap"]["ac"]) { $st["ac_since"] = Util.nowSec(); }
+    if (!writeState($st)) { return fail("nie można zapisać stanu w " . statePath(), "uruchom jako root: sudo legendary battery full"); }
+    Ui.ok("bateria zostanie naładowana do 100 % (do odłączenia zasilacza)");
+    return cmdApply(["flags" => [], "pos" => [], "rest" => []]);
+}
+
+func cmdInhibit($p) {
+    $mode = Cli.pos($p, 0, "");
+    $cur = current();
+    if ($cur === null) { return fail("nie wykryto baterii"); }
+    $f = $cur["snap"]["caps"]["behaviour"];
+    if ($f === null) { return fail("sprzęt nie udostępnia charge_behaviour (nie da się wstrzymać ładowania programowo)", "użyj `legendary battery limit <koniec>` z niskim progiem"); }
+    if ($mode !== "on" && $mode !== "off") {
+        echo $cur["snap"]["behaviour"] ?? "?";
+        return 0;
+    }
+    try { hwWrite($cur["dev"], $f, $mode === "on" ? "inhibit-charge" : "auto"); }
+    catch (Exception $e) { return fail($e->getMessage()); }
+    Ui.ok($mode === "on" ? "ładowanie wstrzymane (zasilacz zasila tylko komputer)" : "ładowanie przywrócone (tryb auto)");
+    return 0;
+}
+
+func cmdCaps($p) {
+    $all = devices();
+    if (count($all) === 0) { return fail("nie wykryto baterii w " . sysRoot()); }
+    $l = loadConfig();
+    foreach ($all as $d) {
+        $c = caps($d);
+        $lines = [];
+        $lines[] = Ui.kv("Producent", attr($d, "manufacturer") ?? "?", 24);
+        $lines[] = Ui.kv("Model", attr($d, "model_name") ?? "?", 24);
+        $lines[] = Ui.kv("Technologia", attr($d, "technology") ?? "?", 24);
+        $yes = Ui.green("tak");
+        $no = Ui.red("nie");
+        $lines[] = Ui.kv("Próg końca", $c["end"] === null ? $no : $yes . Ui.dim("  " . $c["end"]), 24);
+        $lines[] = Ui.kv("Próg startu", $c["start"] === null ? $no . Ui.dim("  (sam próg końca wystarczy)") : $yes . Ui.dim("  " . $c["start"]), 24);
+        $lines[] = Ui.kv("Wstrzymanie ładowania", $c["behaviour"] === null ? $no : $yes . Ui.dim("  charge_behaviour [" . (attr($d, "charge_behaviour") ?? "?") . "]"), 24);
+        $lines[] = Ui.kv("Czujnik temperatury", Os.isFile(sysRoot() . "/" . $d . "/temp") ? $yes : $no, 24);
+        $lines[] = Ui.kv("Używana przez legendary", $l["cfg"]["battery.device"] === "auto" ? ($d === $all[0] ? $yes : $no) : ($d === $l["cfg"]["battery.device"] ? $yes : $no), 24);
+        Ui.printLines(Ui.box("Możliwości · " . $d, $lines, 48));
+    }
+    return 0;
+}
+
+func cmdHistory($p) {
+    $n = Util.intOr(Cli.value($p, "-n", "24", "-n"), 24);
+    if (Cli.pos($p, 0) !== null) { $n = Util.intOr(Cli.pos($p, 0), $n); }
+    $rows = readLog($n);
+    if (count($rows) === 0) { Ui.info("brak historii (" . logPath() . ") — zapisuje ją `legendary battery daemon`"); return 0; }
+    $caps = [];
+    $out = [];
+    foreach ($rows as $r) {
+        $caps[] = intval($r[1]);
+        $out[] = [Time.format(Time.local(intval($r[0])), "%m-%d %H:%M"), $r[1] . " %", replace($r[2], "_", " "), $r[3] === "" ? "-" : $r[3] . " W", $r[4] === "" ? "-" : $r[4] . " %", $r[5] === "" ? "-" : $r[5] . " °C", $r[6] . "–" . $r[7], $r[8]];
+    }
+    Ui.printLines(Ui.table(["Czas", "Poziom", "Stan", "Moc", "Zdrowie", "Temp.", "Progi", "Tryb"], $out));
+    echo "";
+    echo "  " . Ui.dim("poziom: ") . Ui.spark($caps);
+    return 0;
+}
+
+func clearScreen() {
+    if (Util.isTty(1) && Ui.useColor()) { necho(chr(27) . "[H" . chr(27) . "[2J"); }
+    return null;
+}
+
+func cmdWatch($p) {
+    $iv = Util.clamp(Util.intOr(Cli.value($p, "--interval", "2"), 2), 1, 3600);
+    $count = Util.intOr(Cli.value($p, "--count", "0"), 0);
+    $i = 0;
+    while (true) {
+        $res = applyNow(["dry" => true]);
+        if (!$res["ok"] && !has_key($res, "snap")) { return fail($res["error"]); }
+        clearScreen();
+        $d = has_key($res, "decision") ? $res["decision"] : null;
+        Ui.printLines(Ui.box("Bateria · " . $res["dev"], statusLines($res["snap"], $d), 56));
+        echo Ui.dim("  odświeżanie co " . $iv . " s · Ctrl-C kończy");
+        $i++;
+        if ($count > 0 && $i >= $count) { break; }
+        Time.sleep($iv * 1000);
+    }
+    return 0;
+}
+
+func cmdDaemon($p) {
+    $once = Cli.has($p, "--once");
+    $lastLog = 0;
+    while (true) {
+        $l = loadConfig();
+        $iv = $l["cfg"]["battery.interval"];
+        try {
+            $res = applyNow(["dry" => false]);
+            if ($res["ok"]) {
+                if ($res["changed"]) { Ui.ok("[" . $res["clock"]["text"] . "] " . $res["decision"]["start"] . "–" . $res["decision"]["end"] . " % (" . $res["decision"]["mode"] . ")"); }
+                if ($l["cfg"]["battery.log"] && ($res["clock"]["ts"] - $lastLog >= 300 || $res["changed"])) {
+                    appendLog(logLine($res));
+                    $lastLog = $res["clock"]["ts"];
+                }
+            } else {
+                Ui.warn($res["error"]);
+                if (!$once) { Time.sleep(60000); }
+            }
+        } catch (Exception $e) { Ui.error($e->getMessage()); }
+        if ($once) { return 0; }
+        Time.sleep($iv * 1000);
+    }
+    return 0;
+}
+
+func cmd($args) {
+    $sub = count($args) > 0 && !starts_with($args[0], "-") ? $args[0] : "status";
+    $rest = count($args) > 0 && !starts_with($args[0], "-") ? array_slice($args, 1) : $args;
+    $p = Cli.parse($rest, ["-n", "--interval", "--count", "--start", "--end"]);
+    try {
+        if ($sub === "status" || $sub === "show") { return cmdStatus($p); }
+        if ($sub === "limit") { return cmdLimit($p); }
+        if ($sub === "profile" || $sub === "profiles") { return cmdProfile($p); }
+        if ($sub === "set") { return cmdSet($p); }
+        if ($sub === "get") { return cmdGet($p); }
+        if ($sub === "config" || $sub === "conf") { return cmdConfig($p); }
+        if ($sub === "reset") { return cmdReset($p); }
+        if ($sub === "apply") { return cmdApply($p); }
+        if ($sub === "full") { return cmdFull($p); }
+        if ($sub === "inhibit") { return cmdInhibit($p); }
+        if ($sub === "caps" || $sub === "doctor") { return cmdCaps($p); }
+        if ($sub === "history" || $sub === "log") { return cmdHistory($p); }
+        if ($sub === "watch") { return cmdWatch($p); }
+        if ($sub === "daemon") { return cmdDaemon($p); }
+    } catch (Exception $e) {
+        Ui.error($e->getMessage());
+        return 1;
+    }
+    Ui.error("nieznane polecenie `battery " . $sub . "` (legendary help battery)");
+    return 2;
+}
