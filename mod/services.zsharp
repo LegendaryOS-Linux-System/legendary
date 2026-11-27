@@ -1,0 +1,111 @@
+namespace Services;
+
+import Std.Os;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Cli;
+
+##
+ * Services — jednostki zenitd (tylko odczyt).
+ *   jednostki:  <katalogi>/*.service|socket|timer|target|path   (domyślnie /usr/lib/zenit/system, /system/lib/zenit/system,
+ *               /state/etc/zenit/system, /etc/zenit/system; LEGENDARY_ZENIT_DIRS = lista rozdzielona dwukropkami)
+ *   włączone:   <katalog>/<target>.wants/<jednostka>  (jak `zenitctl enable` w lpm/mod/zenit.zsharp)
+##
+
+func dirs() {
+    $e = Os.env("LEGENDARY_ZENIT_DIRS", "");
+    if ($e !== "") { return split($e, ":"); }
+    return ["/usr/lib/zenit/system", "/system/lib/zenit/system", "/state/etc/zenit/system", "/etc/zenit/system"];
+}
+
+func isUnit($n) {
+    foreach ([".service", ".socket", ".timer", ".target", ".path"] as $s) { if (ends_with($n, $s)) { return true; } }
+    return false;
+}
+
+func unitKey($path, $key) {
+    $inSection = false;
+    foreach (Util.lines(Util.readOr($path, "")) as $l) {
+        $t = trim($l);
+        if (starts_with($t, "[")) { $inSection = true; }
+        if (starts_with($t, $key . "=")) { return trim(substr($t, strlen($key) + 1)); }
+    }
+    return "";
+}
+
+# nazwa jednostki => lista targetów, w których jest włączona
+func enabledMap() {
+    $m = [];
+    foreach (dirs() as $d) {
+        if (!Os.isDir($d)) { continue; }
+        foreach (Os.list($d) as $w) {
+            if (!ends_with($w, ".wants") || !Os.isDir($d . "/" . $w)) { continue; }
+            $target = substr($w, 0, strlen($w) - 6);
+            foreach (Os.list($d . "/" . $w) as $u) {
+                if (!has_key($m, $u)) { $m[$u] = []; }
+                if (!in_array($target, $m[$u])) { $m[$u][] = $target; }
+            }
+        }
+    }
+    return $m;
+}
+
+# [["name", "path", "desc", "enabled" => [targety], "wantedBy" => [...]], ...]
+func units() {
+    $en = enabledMap();
+    $seen = [];
+    $out = [];
+    foreach (dirs() as $d) {
+        if (!Os.isDir($d)) { continue; }
+        foreach (Util.sortStrings(Os.list($d)) as $n) {
+            if (!isUnit($n) || in_array($n, $seen) || !Os.isFile($d . "/" . $n)) { continue; }
+            $seen[] = $n;
+            $wb = unitKey($d . "/" . $n, "WantedBy");
+            $out[] = ["name" => $n, "path" => $d . "/" . $n, "desc" => unitKey($d . "/" . $n, "Description"),
+                "enabled" => has_key($en, $n) ? $en[$n] : [], "wantedBy" => $wb === "" ? [] : Util.words($wb)];
+        }
+    }
+    return $out;
+}
+
+func cmdList($p) {
+    $us = units();
+    if (count($us) === 0) { Ui.info("nie znaleziono jednostek zenitd w: " . join(dirs(), ", ")); return 0; }
+    $rows = [];
+    foreach ($us as $u) {
+        if (Cli.has($p, "--enabled") && count($u["enabled"]) === 0) { continue; }
+        $st = count($u["enabled"]) > 0 ? Ui.green("włączona") . Ui.dim(" (" . join($u["enabled"], ", ") . ")") : Ui.gray("domyślna" . (count($u["wantedBy"]) > 0 ? " → " . join($u["wantedBy"], ", ") : ""));
+        $rows[] = [Ui.bold($u["name"]), Ui.clip($u["desc"], 44), $st];
+    }
+    Ui.printLines(Ui.table(["Jednostka", "Opis", "Stan"], $rows));
+    return 0;
+}
+
+func cmdShow($p) {
+    $n = Cli.pos($p, 0);
+    if ($n === null) { Ui.error("użycie: legendary services show <jednostka>"); return 2; }
+    foreach (units() as $u) {
+        if ($u["name"] === $n || $u["name"] === $n . ".service") {
+            echo Ui.dim("# " . $u["path"]);
+            foreach (Util.lines(Os.readFile($u["path"])) as $l) {
+                $t = trim($l);
+                if (starts_with($t, "[")) { echo Ui.accent($l); }
+                else if (starts_with($t, "#")) { echo Ui.gray($l); }
+                else if (index_of($l, "=") > 0) { $i = index_of($l, "="); echo Ui.cyan(substr($l, 0, $i)) . "=" . substr($l, $i + 1); }
+                else { echo $l; }
+            }
+            return 0;
+        }
+    }
+    Ui.error("nie ma jednostki `" . $n . "`");
+    return 1;
+}
+
+func cmd($args) {
+    $sub = count($args) > 0 && !starts_with($args[0], "-") ? $args[0] : "list";
+    $p = Cli.parse(count($args) > 0 && !starts_with($args[0], "-") ? array_slice($args, 1) : $args, []);
+    if ($sub === "list" || $sub === "ls") { return cmdList($p); }
+    if ($sub === "show" || $sub === "cat") { return cmdShow($p); }
+    Ui.error("nieznane polecenie `services " . $sub . "`");
+    return 2;
+}
