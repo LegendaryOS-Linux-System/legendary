@@ -1,0 +1,142 @@
+namespace Help;
+
+import Workspace.Ui;
+import Workspace.Util;
+
+##
+ * Help — jedno źródło prawdy o poleceniach: pomoc, uzupełnianie powłoki i podpowiedzi przy literówkach.
+##
+
+func version() { return "0.1.0"; }
+
+# [nazwa, grupa, opis]
+func commands() {
+    return [
+        ["run", "Narzędzia", "uruchom zainstalowane narzędzie, np. blue-environment"],
+        ["tools", "Narzędzia", "narzędzia z /tools: list, catalog, info, install, update, remove, path"],
+        ["install", "Narzędzia", "skrót: zainstaluj narzędzie z katalogu (tools install)"],
+        ["show", "Interfejs", "interfejs TUI (alternatywa dla CLI)"],
+        ["interface", "Interfejs", "interfejs graficzny (na razie placeholder)"],
+        ["battery", "Bateria", "inteligentne ładowanie: status, profile, limity, plan, historia"],
+        ["info", "System", "informacje o systemie (alias: about)"],
+        ["doctor", "System", "diagnostyka środowiska LegendaryOS"],
+        ["services", "System", "jednostki zenitd: lista, podgląd"],
+        ["system", "System", "obraz systemu przez lpm: status, update, rollback, deployments"],
+        ["lpm", "System", "przekaż polecenie wprost do lpm"],
+        ["config", "System", "ścieżki i bieżące ustawienia legendary"],
+        ["completions", "Inne", "uzupełnianie poleceń: bash | zsh | fish"],
+        ["help", "Inne", "pomoc: legendary help [polecenie]"],
+        ["version", "Inne", "wersja"]
+    ];
+}
+
+func names() {
+    $o = [];
+    foreach (commands() as $c) { $o[] = $c[0]; }
+    return $o;
+}
+
+func aliases() { return ["about" => "info", "tui" => "show", "units" => "services", "ls" => "tools", "b" => "battery"]; }
+
+func usage() {
+    Ui.printLines(Ui.logo());
+    echo "  " . Ui.dim("narzędzie systemowe LegendaryOS · " . version());
+    echo "";
+    echo "  " . Ui.bold("użycie:") . " legendary [--no-color] [-v] [-q] <polecenie> [opcje]";
+    $group = "";
+    foreach (commands() as $c) {
+        if ($c[1] !== $group) {
+            $group = $c[1];
+            echo "";
+            echo Ui.section($group);
+        }
+        echo "    " . Ui.violet(Ui.padR($c[0], 14)) . $c[2];
+    }
+    echo "";
+    echo "  " . Ui.dim("szczegóły: legendary help <polecenie>   ·   kolory: --color=auto|always|never, NO_COLOR");
+    return 0;
+}
+
+func detail($cmd) {
+    $d = [
+        "run" => [
+            "legendary run [--dry-run] [--where] [--system] <narzędzie> [argumenty...]",
+            "",
+            "Znajduje narzędzie w /tools (lpm tools path) i uruchamia je, przekazując argumenty i kod wyjścia.",
+            "Zastępuje skrypt legendary-tool:  legendary run blue-environment",
+            "",
+            "  --dry-run, -n   pokaż, co zostałoby uruchomione",
+            "  --where         wypisz tylko ścieżkę pliku wykonywalnego",
+            "  --system        szukaj w PATH zamiast w /tools (system bez lpm)",
+            "",
+            "Opcje stoją przed nazwą narzędzia; wszystko po nazwie trafia do narzędzia."
+        ],
+        "tools" => [
+            "legendary tools [list|catalog|info|install|update|remove|path|mount] ...",
+            "",
+            "  list [--installed]   narzędzia z katalogu i zainstalowane, ze stanem montowania",
+            "  catalog              tylko katalog (tools.hk)",
+            "  info <n>             szczegóły narzędzia",
+            "  install <n...>       zainstaluj z katalogu (lub: install <n> -- <git> <entry>); --all = wszystko",
+            "  update [n|--all]     przebuduj obraz z najnowszego git",
+            "  remove <n>           usuń narzędzie",
+            "  path <n>             ścieżka pliku wykonywalnego",
+            "  mount                zamontuj wszystkie obrazy",
+            "",
+            "Instalacja/aktualizacja/usuwanie wymagają roota."
+        ],
+        "install" => ["legendary install <narzędzie...> | --all", "", "Skrót do `legendary tools install`. Wymaga roota."],
+        "show" => [
+            "legendary show [--tab nazwa] [--static]",
+            "",
+            "Interfejs TUI z zakładkami: Przegląd, Narzędzia, Bateria, Usługi, Diagnostyka, Pomoc.",
+            "Klawisze: ←/→ lub Tab — zakładki, ↑/↓ — wybór, Enter — akcja, q — wyjście (w TUI: ? = pomoc).",
+            "  --tab nazwa   zakładka startowa (przeglad, narzedzia, bateria, uslugi, diagnostyka, pomoc)",
+            "  --static      jedna ramka bez interakcji (domyślnie, gdy stdin nie jest terminalem)"
+        ],
+        "interface" => ["legendary interface", "", "Graficzny interfejs jako alternatywa dla CLI/TUI. Na razie placeholder — użyj `legendary show`."],
+        "battery" => [
+            "legendary battery [podpolecenie] [opcje]",
+            "",
+            "  status [--json]           stan, zdrowie ogniw, progi, aktywna polityka (domyślne)",
+            "  profile [nazwa]           lista profili albo ustaw: smart full balanced longevity docked custom",
+            "  limit <koniec>|<s> <k>    własne progi ładowania (profil custom), np. limit 80 / limit 40 80",
+            "  set <klucz> <wartość>     zmień ustawienie (np. smart.full_before 07:30)   ·   get <klucz>",
+            "  config [--keys|--path]    bieżące ustawienia / lista kluczy / ścieżka pliku",
+            "  apply [--dry-run]         zastosuj politykę teraz (idempotentne)",
+            "  full [--off]              jednorazowo naładuj do 100 % (do odłączenia zasilacza)",
+            "  inhibit [on|off]          wstrzymaj/wznów ładowanie (jeśli sprzęt pozwala)",
+            "  daemon [--once]           pętla polityki (usługa zenitd legendary-battery)",
+            "  watch [--interval S]      podgląd na żywo",
+            "  history [-n N]            historia zapisana przez daemon",
+            "  caps                      co potrafi sprzęt",
+            "  reset                     przywróć ustawienia domyślne",
+            "",
+            "Profil smart: tryb stacjonarny po dłuższym zasilaniu z sieci, plan „pełna bateria przed godziną X”",
+            "i ochrona termiczna. Zmiany ustawień i zapis progów wymagają roota."
+        ],
+        "info" => ["legendary info [--json]", "", "System, jądro, pamięć, dyski, sesja, lpm, narzędzia i bateria w jednym widoku."],
+        "doctor" => ["legendary doctor", "", "Sprawdza lpm, /tools, katalog, zenitd, baterię, konfigurację i terminal. Kod wyjścia 1 przy błędach."],
+        "services" => ["legendary services [list|show <jednostka>] [--enabled]", "", "Jednostki zenitd z /usr/lib/zenit/system i /state/etc/zenit/system oraz stan włączenia."],
+        "system" => ["legendary system [status|update|rollback|deployments]", "", "Przekazuje do lpm: status, upgrade, rollback, deployments."],
+        "lpm" => ["legendary lpm <argumenty...>", "", "Przekazuje wszystko wprost do lpm."],
+        "config" => ["legendary config", "", "Ścieżki (lpm, katalog narzędzi, konfiguracja baterii) i zmienne środowiska."],
+        "completions" => ["legendary completions bash|zsh|fish", "", "Wypisuje skrypt uzupełniania, np.:  legendary completions bash > /etc/bash_completion.d/legendary"],
+        "help" => ["legendary help [polecenie]", "", "Pokazuje pomoc."],
+        "version" => ["legendary version", "", "Wypisuje wersję."]
+    ];
+    return has_key($d, $cmd) ? $d[$cmd] : null;
+}
+
+func show($cmd) {
+    $a = aliases();
+    if (has_key($a, $cmd)) { $cmd = $a[$cmd]; }
+    $d = detail($cmd);
+    if ($d === null) {
+        Ui.error("brak pomocy dla `" . $cmd . "`");
+        return 2;
+    }
+    echo Ui.accent($d[0]);
+    for ($i = 1; $i < count($d); $i++) { echo $d[$i] === "" ? "" : "  " . $d[$i]; }
+    return 0;
+}
