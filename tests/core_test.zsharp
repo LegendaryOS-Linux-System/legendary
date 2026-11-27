@@ -1,0 +1,51 @@
+import Std.Os;
+import Workspace.Ui;
+import Workspace.Cli;
+import Workspace.Hk;
+import Workspace.Util;
+
+# Test Ui / Cli / Hk / Util (bez I/O). Wynik: tests/core_test.out.
+Os.setEnv("LEGENDARY_COLOR", "never");
+
+echo "--- Ui";
+Ui.printLines(Ui.box("Test", ["abc", "zażółć gęślą", Ui.bar(62, 20, [40, 80])]));
+Ui.printLines(Ui.table(["Nazwa", "Stan"], [["a", "ok"], ["bbbb", "x"]]));
+echo Ui.spark([1, 3, 2, 8, 5]) . " " . Ui.vlen("zażółć") . " " . Ui.clip("abcdefghij", 5) . " [" . Ui.center("ab", 6) . "]";
+echo Ui.bar(0, 10) . " " . Ui.bar(100, 10) . " " . Ui.bar(150, 10);
+Os.setEnv("LEGENDARY_COLOR", "always");
+echo Ui.vlen(Ui.red("zażółć")) . " " . (strlen(Ui.red("x")) > 1 ? "kolor: są sekwencje" : "kolor: BRAK");
+Os.setEnv("LEGENDARY_COLOR", "never");
+echo (strlen(Ui.red("x")) === 1 ? "bez koloru: czysty tekst" : "bez koloru: BŁĄD");
+
+echo "--- Cli.split";
+echo Cli.split(["--no-color", "-q", "run", "blue", "--foo", "x"]);
+echo Cli.split(["--color", "always", "battery"]);
+echo Cli.split(["-h"]);
+echo Cli.split([]);
+echo "--- Cli.globalsIn";
+echo Cli.globalsIn(["a", "--no-color", "b", "--", "--no-color"], Cli.newGlobals());
+echo "--- Cli.parse";
+echo Cli.parse(["--end", "80", "pos", "-5", "--x=1", "--", "r"], ["--end"]);
+
+echo "--- Hk.parse";
+echo Hk.parse("! c\n[battery]\n-> profile => smart\n-> start => 40\n\n[smart]\n-> days => [mon, tue]\n-> x\n--> y => 1\n-> q => \"cytat\"\n");
+foreach (["[a\n", "-> x => 1\n", "[a]\n--> x => 1\n", "[a]\nfoo\n", "[a]\n-> => 1\n"] as $bad) {
+    try { Hk.parse($bad, "t.hk"); echo "BRAK BŁĘDU"; } catch (Exception $e) { echo $e->getMessage(); }
+}
+echo "--- Hk.setValue (komentarze zostają)";
+$t = "! komentarz\n[battery]\n-> profile => smart\n! kom2\n-> start => 40\n\n[smart]\n-> days => [mon, tue]\n";
+echo Hk.setValue($t, "battery", "start", 55);
+echo Hk.setValue($t, "battery", "end", 90);
+echo Hk.setValue($t, "nowa", "a", true);
+echo Hk.setValue("", "s", "k", ["a", "b"]);
+echo "--- Hk.encode";
+echo Hk.encode(["state" => ["ac_since" => 5, "override" => "", "l" => ["x", "y"]], "m" => ["k" => ["a" => 1, "b" => true]]]);
+
+echo "--- Util";
+echo Util.lines("a\nb\n");
+echo Util.duration(8100) . "|" . Util.duration(45) . "|" . Util.duration(200000) . "|" . Util.fixed1(7.46) . "|" . Util.bytesText(1610612736) . "|" . Util.hhmm(450) . "|" . Util.hhmm(-30);
+echo Util.parseHhmm("07:30") . " " . (Util.parseHhmm("7:5x") ?? "null") . " " . (Util.parseHhmm("24:00") ?? "null");
+echo Util.sortStrings(["b", "a", "c", "ab"]);
+echo Util.words("  a  b\tc ");
+echo Util.divRound(7, 2) . " " . Util.intOr("12", 0) . " " . Util.intOr("x", 5) . " " . Util.intOr("-3", 0);
+echo Util.clamp(5, 0, 3) . " " . Util.clamp(-1, 0, 3);
