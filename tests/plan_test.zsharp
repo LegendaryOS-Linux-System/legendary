@@ -1,0 +1,71 @@
+import Workspace.Plan;
+import Workspace.Hk;
+
+# Test czystej logiki inteligentnego ładowania (bez I/O). Wynik porównywany z tests/plan_test.out.
+
+func show($title, $d) {
+    echo $title . ": " . $d["start"] . "-" . $d["end"] . " [" . $d["mode"] . "]";
+    foreach ($d["reasons"] as $r) { echo "    - " . $r; }
+}
+
+func snap($cap, $ac, $acSince, $temp = null, $override = "") {
+    return ["capacity" => $cap, "ac" => $ac, "acSince" => $acSince, "temp" => $temp, "override" => $override];
+}
+
+# czwartek 2026-11-26, godz. 08:00 → weekday 4, minutes 480, ts umowny
+func clock($weekday, $hh, $mm) { return ["ts" => 1000000, "minutes" => $hh * 60 + $mm, "weekday" => $weekday, "text" => ""]; }
+
+$cfg = Plan.defaults();
+show("smart domyślny, na baterii", Plan.decide($cfg, snap(70, false, null), clock(4, 8, 0)));
+show("smart, zasilacz 1 h", Plan.decide($cfg, snap(70, true, 1000000 - 3600), clock(4, 8, 0)));
+show("smart, zasilacz 5 h → dock", Plan.decide($cfg, snap(70, true, 1000000 - 5 * 3600), clock(4, 8, 0)));
+
+$cfg["smart.full_before"] = "07:30";
+show("plan 07:30, czwartek 08:00 (dokładnie +30 min: jeszcze aktywny)", Plan.decide($cfg, snap(60, true, null), clock(4, 8, 0)));
+show("plan 07:30, czwartek 08:15 (po oknie)", Plan.decide($cfg, snap(60, true, null), clock(4, 8, 15)));
+show("plan 07:30, czwartek 07:45 (tuż po godzinie)", Plan.decide($cfg, snap(60, true, null), clock(4, 7, 45)));
+show("plan 07:30, czwartek 05:00 (60 %: zapas 100 min, jeszcze za wcześnie)", Plan.decide($cfg, snap(60, true, null), clock(4, 5, 0)));
+show("plan 07:30, czwartek 06:00 (60 %: w oknie)", Plan.decide($cfg, snap(60, true, null), clock(4, 6, 0)));
+show("plan 07:30, czwartek 06:00 (95 %: krótkie okno 30 min → jeszcze nie)", Plan.decide($cfg, snap(95, true, null), clock(4, 6, 0)));
+show("plan 07:30, sobota 06:00 (weekend)", Plan.decide($cfg, snap(60, true, null), clock(6, 6, 0)));
+show("plan 07:30, niedziela 23:30 (poniedziałek dopiero za 8 h)", Plan.decide($cfg, snap(20, true, null), clock(0, 23, 30)));
+show("plan 07:30, poniedziałek 05:00 (20 %: okno 3 h)", Plan.decide($cfg, snap(20, true, null), clock(1, 5, 0)));
+$cfgMid = Plan.defaults();
+$cfgMid["smart.full_before"] = "00:30";
+$cfgMid["smart.full_days"] = ["mon"];
+show("plan 00:30 w poniedziałek, niedziela 23:30 (przejście przez północ)", Plan.decide($cfgMid, snap(20, true, null), clock(0, 23, 30)));
+show("plan + dock w oknie planu: plan wygrywa", Plan.decide($cfg, snap(60, true, 1000000 - 9 * 3600), clock(4, 6, 0)));
+
+$cfg2 = Plan.defaults();
+$cfg2["battery.profile"] = "longevity";
+show("longevity", Plan.decide($cfg2, snap(50, true, null), clock(4, 8, 0)));
+show("longevity + override full", Plan.decide($cfg2, snap(50, true, null, null, "full"), clock(4, 8, 0)));
+show("longevity + gorąco 45 °C przy 62 %", Plan.decide($cfg2, snap(62, true, null, 45.0), clock(4, 8, 0)));
+$cfg2["smart.temp_max"] = 0;
+show("longevity, ochrona termiczna wyłączona", Plan.decide($cfg2, snap(62, true, null, 45.0), clock(4, 8, 0)));
+$cfg2["battery.profile"] = "custom";
+$cfg2["battery.start"] = 30;
+$cfg2["battery.end"] = 85;
+show("custom 30-85", Plan.decide($cfg2, snap(50, true, null), clock(4, 8, 0)));
+$cfg2["battery.end"] = 20;
+$cfg2["battery.start"] = 90;
+show("custom z błędnymi progami (normalizacja)", Plan.decide($cfg2, snap(50, true, null), clock(4, 8, 0)));
+
+echo "--- walidacja";
+foreach ([["battery.end", "80"], ["battery.end", "120"], ["battery.end", "abc"], ["battery.profile", "Smart"], ["battery.profile", "x"],
+          ["smart.full_before", "7:30"], ["smart.full_before", "25:00"], ["smart.full_before", "off"], ["smart.full_days", "mon, Fri,sun"],
+          ["smart.full_days", "xyz"], ["battery.log", "tak"], ["nie.ma", "1"]] as $t) {
+    echo $t[0] . " = " . $t[1] . " → " . Plan.validate($t[0], $t[1]);
+}
+
+echo "--- fromDoc";
+$doc = Hk.parse("[battery]\n-> profile => longevity\n-> end => 200\n[smart]\n-> full_days => [sat, sun]\n-> temp_max => 38\n");
+$r = Plan.fromDoc($doc);
+echo $r["cfg"]["battery.profile"], $r["cfg"]["battery.end"], $r["cfg"]["smart.full_days"], $r["cfg"]["smart.temp_max"];
+echo $r["problems"];
+
+echo "--- eta / zdrowie";
+echo Plan.etaSeconds(["status" => "Discharging", "powerUw" => 10000000, "energyNow" => 40000000, "energyFull" => 50000000]);
+echo Plan.etaSeconds(["status" => "Charging", "powerUw" => 25000000, "energyNow" => 40000000, "energyFull" => 50000000]);
+echo Plan.etaSeconds(["status" => "Full", "powerUw" => 0, "energyNow" => 1, "energyFull" => 1]) ?? "brak";
+echo Plan.healthPct(["energyFull" => 45000000, "energyDesign" => 50000000]);
