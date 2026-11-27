@@ -1,1 +1,125 @@
+import Std.Os;
+import Std.Text;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Cli;
+import Workspace.Help;
+import Workspace.Lpm;
+import Workspace.Tools;
+import Workspace.Battery;
+import Workspace.Sysinfo;
+import Workspace.Services;
+import Workspace.Doctor;
+import Workspace.Complete;
+import Workspace.Tui;
 
+##
+ * legendary — narzędzie systemowe LegendaryOS, napisane w 100% w Z#.
+ *
+ *   legendary run blue-environment      uruchom narzędzie z /tools (zamiast skryptu legendary-tool)
+ *   legendary show                      interfejs TUI
+ *   legendary battery                   inteligentne ładowanie baterii
+ *   legendary help                      wszystkie polecenia
+ *
+ * Wejście: main() zwraca kod wyjścia. Flagi globalne (--no-color, --color=…, -v, -q) działają przed i po poleceniu
+ * — z wyjątkiem `run`, które po nazwie narzędzia przekazuje WSZYSTKO dalej bez interpretacji.
+##
+
+func applyGlobals($g) {
+    if ($g["color"] === "always" || $g["color"] === "never" || $g["color"] === "auto") { Os.setEnv("LEGENDARY_COLOR", $g["color"]); }
+    else if ($g["color"] !== "") { Ui.warn("nieznana wartość --color=" . $g["color"] . " (auto, always, never)"); }
+    if ($g["verbose"]) { Os.setEnv("LEGENDARY_VERBOSE", "1"); }
+    if ($g["quiet"]) { Os.setEnv("LEGENDARY_QUIET", "1"); }
+    return null;
+}
+
+func unknown($cmd) {
+    Ui.error("nieznane polecenie `" . $cmd . "`");
+    $s = [];
+    foreach (Help.names() as $n) {
+        if (Text.levenshtein($cmd, $n) <= 2 || starts_with($n, $cmd)) { $s[] = $n; }
+    }
+    if (count($s) > 0) { Ui.hint("czy chodziło o: " . join($s, ", ") . "?"); }
+    else { Ui.hint("lista poleceń: legendary help"); }
+    return 2;
+}
+
+func cmdSystem($args) {
+    $sub = count($args) > 0 ? $args[0] : "status";
+    $map = ["status" => "status", "update" => "upgrade", "upgrade" => "upgrade", "rollback" => "rollback", "deployments" => "deployments"];
+    if (!has_key($map, $sub)) {
+        Ui.error("użycie: legendary system [status|update|rollback|deployments]");
+        return 2;
+    }
+    if (($sub === "update" || $sub === "upgrade" || $sub === "rollback") && !Util.isRoot()) {
+        Ui.error("`system " . $sub . "` zmienia obraz systemu — wymaga roota");
+        Ui.hint("sudo legendary system " . $sub);
+        return 1;
+    }
+    return Lpm.passthrough(array_merge_list([$map[$sub]], array_slice($args, 1)));
+}
+
+func array_merge_list($a, $b) {
+    $out = $a;
+    foreach ($b as $x) { $out[] = $x; }
+    return $out;
+}
+
+func cmdConfig($args) {
+    $L = [];
+    $L[] = Ui.kv("lpm", (Lpm.available() ? Lpm.bin() : Ui.gray("niedostępny")), 20);
+    $L[] = Ui.kv("katalog narzędzi", Tools.catalogPath() ?? Ui.gray("nie znaleziono tools.hk"), 20);
+    $L[] = Ui.kv("konfig baterii", (Util.firstExisting(Battery.confSearch()) ?? Ui.gray("(brak)")) . Ui.dim("   zapis: " . Battery.confWritePath()), 20);
+    $L[] = Ui.kv("sysfs baterii", Battery.sysRoot(), 20);
+    $L[] = Ui.kv("stan (/run)", Battery.statePath(), 20);
+    $L[] = Ui.kv("historia", Battery.logPath(), 20);
+    $L[] = Ui.kv("jednostki zenitd", Services.dirs()[0] . Ui.dim("  (+" . (count(Services.dirs()) - 1) . " katalogi)"), 20);
+    $L[] = "";
+    $L[] = Ui.kv("kolory", (Ui.useColor() ? Ui.green("włączone") : Ui.gray("wyłączone")) . Ui.dim("   --color=auto|always|never, NO_COLOR"), 20);
+    $L[] = Ui.kv("zmienne", Ui.dim("LEGENDARY_LPM, LEGENDARY_TOOLS_CATALOG,"), 20);
+    $L[] = Ui.kv("", Ui.dim("LEGENDARY_BATTERY_CONF, LEGENDARY_SYSFS_ROOT,"), 20);
+    $L[] = Ui.kv("", Ui.dim("LEGENDARY_RUN_DIR, LEGENDARY_STATE_DIR,"), 20);
+    $L[] = Ui.kv("", Ui.dim("LEGENDARY_ZENIT_DIRS, LEGENDARY_COLOR"), 20);
+    Ui.printLines(Ui.box("Konfiguracja legendary", $L, 60));
+    return 0;
+}
+
+func dispatch($cmd, $rest) {
+    $aliases = Help.aliases();
+    if (has_key($aliases, $cmd)) { $cmd = $aliases[$cmd]; }
+    if ($cmd === "run") { return Tools.run($rest); }
+    # pozostałe polecenia: flagi globalne mogą stać też za poleceniem
+    $g = Cli.globalsIn($rest, Cli.newGlobals());
+    applyGlobals($g["global"]);
+    $a = $g["args"];
+    if (count($a) > 0 && ($a[0] === "--help" || $a[0] === "-h") && $cmd !== "help") { return Help.show($cmd); }
+    if ($cmd === "tools") { return Tools.cmd($a); }
+    if ($cmd === "install") { return Tools.cmd(array_merge_list(["install"], $a)); }
+    if ($cmd === "show") { return Tui.cmd($a); }
+    if ($cmd === "interface") { return Tui.interfaceCmd($a); }
+    if ($cmd === "battery") { return Battery.cmd($a); }
+    if ($cmd === "info") { return Sysinfo.cmd($a); }
+    if ($cmd === "doctor") { return Doctor.cmd($a); }
+    if ($cmd === "services") { return Services.cmd($a); }
+    if ($cmd === "system") { return cmdSystem($a); }
+    if ($cmd === "lpm") { return Lpm.passthrough($a); }
+    if ($cmd === "config") { return cmdConfig($a); }
+    if ($cmd === "completions") { return Complete.cmd($a); }
+    if ($cmd === "help") { return count($a) > 0 ? Help.show($a[0]) : Help.usage(); }
+    if ($cmd === "version") {
+        echo "legendary " . Help.version() . Ui.dim("  (Z# " . System.version() . ")");
+        return 0;
+    }
+    return unknown($cmd);
+}
+
+func main(): int {
+    $sp = Cli.split(Os.args());
+    applyGlobals($sp["global"]);
+    if ($sp["cmd"] === "") { return Help.usage(); }
+    try { return dispatch($sp["cmd"], $sp["rest"]); }
+    catch (Exception $e) {
+        Ui.error($e->getMessage());
+        return 1;
+    }
+}
