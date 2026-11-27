@@ -1,0 +1,138 @@
+namespace Sysinfo;
+
+import Std.Os;
+import Std.Json;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Cli;
+import Workspace.Help;
+import Workspace.Lpm;
+import Workspace.Battery;
+
+##
+ * Sysinfo — `legendary info`: zebrane z /proc, /etc/os-release, df i lpm informacje o systemie.
+##
+
+func osRelease() {
+    $p = Util.firstExisting(["/etc/os-release", "/usr/lib/os-release", "/system/etc/os-release"]);
+    $out = [];
+    if ($p === null) { return $out; }
+    foreach (Util.lines(Os.readFile($p)) as $l) {
+        $i = index_of($l, "=");
+        if ($i < 1) { continue; }
+        $v = trim(substr($l, $i + 1));
+        if (strlen($v) >= 2 && starts_with($v, "\"") && ends_with($v, "\"")) { $v = substr($v, 1, strlen($v) - 2); }
+        $out[substr($l, 0, $i)] = $v;
+    }
+    return $out;
+}
+
+func procValue($file, $key) {
+    foreach (Util.lines(Util.readOr($file, "")) as $l) {
+        if (starts_with($l, $key)) {
+            $i = index_of($l, ":");
+            if ($i >= 0) { return trim(substr($l, $i + 1)); }
+        }
+    }
+    return null;
+}
+
+func kib($text) {
+    if ($text === null) { return null; }
+    $w = Util.words($text);
+    return count($w) > 0 && Util.isIntText($w[0]) ? intval($w[0]) * 1024 : null;
+}
+
+func uptimeSeconds() {
+    $t = Util.readTrim("/proc/uptime");
+    if ($t === null) { return null; }
+    $w = Util.words($t);
+    return count($w) > 0 ? intval(floatval($w[0])) : null;
+}
+
+# [["mount", "size", "used", "pct"], ...]
+func disks() {
+    $paths = [];
+    foreach (["/", "/state", "/home", "/tools", "/packages"] as $p) { if (Os.isDir($p)) { $paths[] = $p; } }
+    $r = Util.run("df", array_merge_list(["-Pk"], $paths));
+    $out = [];
+    if ($r["status"] !== 0 && $r["stdout"] === "") { return $out; }
+    $seen = [];
+    foreach (Util.lines($r["stdout"]) as $i => $l) {
+        if ($i === 0) { continue; }
+        $w = Util.words($l);
+        if (count($w) < 6) { continue; }
+        $mount = $w[5];
+        if (in_array($mount, $seen)) { continue; }
+        $seen[] = $mount;
+        $out[] = ["mount" => $mount, "size" => intval($w[1]) * 1024, "used" => intval($w[2]) * 1024,
+            "pct" => Util.intOr(replace($w[4], "%", ""), 0)];
+    }
+    return $out;
+}
+
+func array_merge_list($a, $b) {
+    $out = $a;
+    foreach ($b as $x) { $out[] = $x; }
+    return $out;
+}
+
+func collect() {
+    $os = osRelease();
+    $kernel = Util.readTrim("/proc/sys/kernel/osrelease") ?? Util.capture("uname", ["-r"]) ?? "?";
+    $memT = kib(procValue("/proc/meminfo", "MemTotal"));
+    $memA = kib(procValue("/proc/meminfo", "MemAvailable"));
+    $load = Util.readTrim("/proc/loadavg");
+    $bat = Battery.current();
+    return [
+        "legendary" => Help.version(),
+        "os" => has_key($os, "PRETTY_NAME") ? $os["PRETTY_NAME"] : (has_key($os, "NAME") ? $os["NAME"] : "LegendaryOS"),
+        "kernel" => $kernel, "arch" => Os.arch(), "host" => Os.hostname(),
+        "uptimeSeconds" => uptimeSeconds(),
+        "cpu" => procValue("/proc/cpuinfo", "model name") ?? "?", "cores" => Os.cpus(),
+        "memTotal" => $memT, "memAvailable" => $memA,
+        "load" => $load === null ? null : join(array_slice(Util.words($load), 0, 3), " "),
+        "disks" => disks(),
+        "desktop" => Os.env("XDG_CURRENT_DESKTOP", ""), "sessionType" => Os.env("XDG_SESSION_TYPE", ""),
+        "shell" => Os.env("SHELL", ""), "term" => Os.env("TERM", ""), "user" => Os.env("USER", ""),
+        "lpm" => Lpm.version(), "tools" => count(Lpm.toolList()),
+        "battery" => $bat === null ? null : ["dev" => $bat["dev"], "capacity" => $bat["snap"]["capacity"], "status" => $bat["snap"]["status"], "ac" => $bat["snap"]["ac"]],
+        "zsharp" => System.version()
+    ];
+}
+
+func lines($i, $width = 22) {
+    $L = [];
+    $L[] = Ui.kv("System", Ui.bold($i["os"]), 12);
+    $L[] = Ui.kv("Jądro", $i["kernel"] . Ui.dim("  " . $i["arch"]), 12);
+    $L[] = Ui.kv("Host", $i["host"] . ($i["user"] !== "" ? Ui.dim("  (" . $i["user"] . ")") : ""), 12);
+    if ($i["uptimeSeconds"] !== null) { $L[] = Ui.kv("Działa od", Util.duration($i["uptimeSeconds"]), 12); }
+    $L[] = Ui.kv("CPU", Ui.clip($i["cpu"], 40) . Ui.dim("  ×" . $i["cores"]), 12);
+    if ($i["load"] !== null) { $L[] = Ui.kv("Obciążenie", $i["load"], 12); }
+    if ($i["memTotal"] !== null && $i["memAvailable"] !== null) {
+        $used = $i["memTotal"] - $i["memAvailable"];
+        $pct = intval(Math.round($used * 100 / $i["memTotal"]));
+        $L[] = Ui.kv("Pamięć", Ui.bar($pct, $width, [], 75) . " " . Util.bytesText($used) . " / " . Util.bytesText($i["memTotal"]), 12);
+    }
+    foreach ($i["disks"] as $d) {
+        $L[] = Ui.kv("Dysk " . $d["mount"], Ui.bar($d["pct"], $width, [], $d["pct"] >= 90 ? 203 : 75) . " " . Util.bytesText($d["used"]) . " / " . Util.bytesText($d["size"]), 12);
+    }
+    if ($i["desktop"] !== "" || $i["sessionType"] !== "") { $L[] = Ui.kv("Sesja", join([$i["desktop"], $i["sessionType"]], " ") . "", 12); }
+    $L[] = Ui.kv("lpm", $i["lpm"] === null ? Ui.gray("niedostępny") : $i["lpm"], 12);
+    $L[] = Ui.kv("Narzędzia", $i["tools"] . Ui.dim(" w /tools"), 12);
+    if ($i["battery"] !== null) {
+        $b = $i["battery"];
+        $L[] = Ui.kv("Bateria", Ui.bar($b["capacity"], $width) . " " . $b["capacity"] . " % " . Battery.statusText($b["status"]), 12);
+    }
+    $L[] = Ui.kv("legendary", $i["legendary"] . Ui.dim("  (Z# " . $i["zsharp"] . ")"), 12);
+    return $L;
+}
+
+func cmd($args) {
+    $p = Cli.parse($args, []);
+    $i = collect();
+    if (Cli.has($p, "--json")) { echo Json.encodePretty($i); return 0; }
+    Ui.printLines(Ui.logo());
+    Ui.printLines(Ui.box("LegendaryOS", lines($i), 50));
+    return 0;
+}
