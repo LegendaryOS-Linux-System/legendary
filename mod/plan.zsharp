@@ -1,0 +1,257 @@
+namespace Plan;
+
+import Workspace.Util;
+import Workspace.Hk;
+
+##
+ * Plan — czysta logika inteligentnego ładowania (BEZ I/O, więc w całości testowalna):
+ *   profiles()   gotowe profile (próg startu/końca ładowania w %)
+ *   schema()     dozwolone klucze konfiguracji + walidacja (`legendary battery set`)
+ *   fromDoc()    dokument .hk → płaska konfiguracja (klucze „sekcja.nazwa”)
+ *   decide()     konfiguracja + stan baterii + zegar → progi do zapisania w sysfs i uzasadnienie
+ *   etaSeconds() szacowany czas do rozładowania / naładowania
+ *
+ * Reguły profilu „smart” (kolejność, każda następna może nadpisać poprzednią):
+ *   1. profil bazowy (smart.base),
+ *   2. tryb stacjonarny: zasilacz podłączony nieprzerwanie ≥ smart.dock_hours → progi smart.dock_profile,
+ *   3. plan „pełna bateria przed godziną X” (smart.full_before w dniach smart.full_days) — ładowanie do 100 %
+ *      ruszy na tyle wcześniej, ile potrzeba przy szacowanej szybkości smart.charge_rate (%/h),
+ *   4. jednorazowe pełne ładowanie (`legendary battery full`) — aż do odłączenia zasilacza,
+ *   5. ochrona termiczna (zawsze na końcu): temperatura ≥ smart.temp_max → ładowanie wstrzymane.
+ * Profile stałe (full/balanced/longevity/docked/custom) stosują tylko 4 i 5.
+##
+
+func profiles() {
+    return [
+        "full" => ["start" => 95, "end" => 100, "label" => "pełna pojemność — maksymalny czas pracy (podróż)"],
+        "balanced" => ["start" => 75, "end" => 90, "label" => "zrównoważony — codzienne użytkowanie"],
+        "longevity" => ["start" => 40, "end" => 80, "label" => "żywotność — najmniejsze zużycie ogniw"],
+        "docked" => ["start" => 40, "end" => 60, "label" => "stacjonarny — laptop stale na zasilaczu"]
+    ];
+}
+
+func profileNames() { return ["smart", "full", "balanced", "longevity", "docked", "custom"]; }
+func baseNames() { return ["full", "balanced", "longevity", "docked", "custom"]; }
+func dayNames() { return ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]; }
+func dayLabels() { return ["niedziela", "poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota"]; }
+
+func schema() {
+    return [
+        "battery.profile" => ["type" => "enum", "enum" => profileNames(), "default" => "smart",
+            "help" => "aktywny profil: smart | full | balanced | longevity | docked | custom"],
+        "battery.start" => ["type" => "int", "min" => 0, "max" => 99, "default" => 40,
+            "help" => "profil custom: poniżej tego poziomu ładowanie wznawia się (%)"],
+        "battery.end" => ["type" => "int", "min" => 20, "max" => 100, "default" => 80,
+            "help" => "profil custom: do tego poziomu ładuje (%)"],
+        "battery.device" => ["type" => "string", "default" => "auto",
+            "help" => "nazwa baterii w /sys/class/power_supply (auto = pierwsza)"],
+        "battery.interval" => ["type" => "int", "min" => 10, "max" => 3600, "default" => 60,
+            "help" => "co ile sekund działa `legendary battery daemon`"],
+        "battery.log" => ["type" => "bool", "default" => true,
+            "help" => "czy daemon zapisuje historię (battery.csv)"],
+        "smart.base" => ["type" => "enum", "enum" => baseNames(), "default" => "balanced",
+            "help" => "smart: profil bazowy"],
+        "smart.dock_hours" => ["type" => "int", "min" => 1, "max" => 72, "default" => 4,
+            "help" => "smart: po tylu godzinach na zasilaczu włącz tryb stacjonarny"],
+        "smart.dock_profile" => ["type" => "enum", "enum" => baseNames(), "default" => "docked",
+            "help" => "smart: profil trybu stacjonarnego"],
+        "smart.temp_max" => ["type" => "int", "min" => 0, "max" => 70, "default" => 42,
+            "help" => "wstrzymaj ładowanie od tej temperatury w °C (0 = wyłączone)"],
+        "smart.full_before" => ["type" => "hhmm", "default" => "",
+            "help" => "smart: bateria ma być pełna przed tą godziną (HH:MM; puste = brak planu)"],
+        "smart.full_days" => ["type" => "days", "default" => ["mon", "tue", "wed", "thu", "fri"],
+            "help" => "smart: dni planu pełnego naładowania (mon,tue,wed,thu,fri,sat,sun)"],
+        "smart.charge_rate" => ["type" => "int", "min" => 5, "max" => 100, "default" => 30,
+            "help" => "smart: szacowana szybkość ładowania w % na godzinę"]
+    ];
+}
+
+func defaults() {
+    $c = [];
+    foreach (schema() as $k => $s) { $c[$k] = $s["default"]; }
+    return $c;
+}
+
+# ───────────────── walidacja ─────────────────
+func parseBool($v) {
+    if ($v === true || $v === false) { return $v; }
+    $t = lower(trim(strval($v)));
+    if (in_array($t, ["true", "1", "yes", "on", "tak"])) { return true; }
+    if (in_array($t, ["false", "0", "no", "off", "nie"])) { return false; }
+    return null;
+}
+
+func parseDays($v) {
+    $parts = [];
+    if (is_array($v)) { $parts = $v; } else { $parts = split(strval($v), ","); }
+    $out = [];
+    foreach ($parts as $p) {
+        $p = lower(trim(strval($p)));
+        if ($p === "") { continue; }
+        $p = substr($p, 0, 3);
+        if (!in_array($p, dayNames())) { return null; }
+        if (!in_array($p, $out)) { $out[] = $p; }
+    }
+    return $out;
+}
+
+# [ok, wartość|komunikat]
+func validate($key, $raw) {
+    $all = schema();
+    if (!has_key($all, $key)) { return [false, "nieznany klucz `" . $key . "` (legendary battery config --keys)"]; }
+    $s = $all[$key];
+    $t = $s["type"];
+    if ($t === "int") {
+        if (!Util.isIntText($raw)) { return [false, $key . ": oczekiwano liczby całkowitej, jest `" . strval($raw) . "`"]; }
+        $n = intval($raw);
+        if ($n < $s["min"] || $n > $s["max"]) { return [false, $key . ": poza zakresem " . $s["min"] . "–" . $s["max"] . " (jest " . $n . ")"]; }
+        return [true, $n];
+    }
+    if ($t === "bool") {
+        $b = parseBool($raw);
+        if ($b === null) { return [false, $key . ": oczekiwano true/false"]; }
+        return [true, $b];
+    }
+    if ($t === "enum") {
+        $v = lower(trim(strval($raw)));
+        if (!in_array($v, $s["enum"])) { return [false, $key . ": dozwolone: " . join($s["enum"], ", ")]; }
+        return [true, $v];
+    }
+    if ($t === "hhmm") {
+        $v = trim(strval($raw));
+        if ($v === "" || $v === "off" || $v === "none") { return [true, ""]; }
+        $m = Util.parseHhmm($v);
+        if ($m === null) { return [false, $key . ": oczekiwano godziny HH:MM (np. 07:30)"]; }
+        return [true, Util.hhmm($m)];
+    }
+    if ($t === "days") {
+        $d = parseDays($raw);
+        if ($d === null) { return [false, $key . ": dni to " . join(dayNames(), ", ") . " (oddzielone przecinkami)"]; }
+        return [true, $d];
+    }
+    return [true, trim(strval($raw))];
+}
+
+# dokument .hk → ["cfg" => płaska konfiguracja, "problems" => [komunikaty]]
+func fromDoc($doc) {
+    $cfg = defaults();
+    $problems = [];
+    foreach (schema() as $key => $s) {
+        $dot = index_of($key, ".");
+        $sec = substr($key, 0, $dot);
+        $name = substr($key, $dot + 1);
+        $raw = Hk.get($doc, $sec, $name, null);
+        if ($raw === null) { continue; }
+        $r = validate($key, $raw);
+        if ($r[0]) { $cfg[$key] = $r[1]; } else { $problems[] = $r[1] . " — używam domyślnej wartości"; }
+    }
+    return ["cfg" => $cfg, "problems" => $problems];
+}
+
+# ───────────────── progi ─────────────────
+func normalize($start, $end) {
+    $e = Util.clamp(intval($end), 20, 100);
+    $s = Util.clamp(intval($start), 0, 98);
+    if ($s > $e - 2) { $s = $e - 2; }
+    if ($s < 0) { $s = 0; }
+    return [$s, $e];
+}
+
+func limitsOf($cfg, $profile) {
+    $all = profiles();
+    if ($profile === "custom" || !has_key($all, $profile)) { return normalize($cfg["battery.start"], $cfg["battery.end"]); }
+    return normalize($all[$profile]["start"], $all[$profile]["end"]);
+}
+
+func limText($l) { return $l[0] . "–" . $l[1] . " %"; }
+
+# ───────────────── plan „pełna przed godziną X” ─────────────────
+# [aktywny, minut do godziny docelowej (ujemne = już po niej), zapas w minutach]
+func fullWindow($cfg, $cap, $clock) {
+    $t = Util.parseHhmm($cfg["smart.full_before"]);
+    if ($t === null) { return [false, 0, 0]; }
+    $days = [];
+    foreach ($cfg["smart.full_days"] as $d) { $days[] = array_index(dayNames(), $d); }
+    if (count($days) === 0) { return [false, 0, 0]; }
+    $need = 100 - Util.clamp($cap, 0, 100);
+    $lead = intval(Math.ceil($need * 60 / $cfg["smart.charge_rate"])) + 20;
+    $lead = Util.clamp($lead, 30, 720);
+    $nowW = $clock["weekday"] * 1440 + $clock["minutes"];
+    foreach ($days as $d) {
+        $delta = (($d * 1440 + $t - $nowW) % 10080 + 10080) % 10080;
+        if ($delta <= $lead) { return [true, $delta, $lead]; }
+        if ((10080 - $delta) <= 30) { return [true, $delta - 10080, $lead]; }
+    }
+    return [false, 0, $lead];
+}
+
+func array_index($list, $x) {
+    foreach ($list as $i => $v) { if ($v === $x) { return $i; } }
+    return -1;
+}
+
+##
+ * Główna decyzja. $snap: ["capacity" => int, "ac" => bool, "temp" => float|null, "acSince" => int|null, "override" => ""|"full"]
+ * $clock: Util.clockNow(). Wynik: ["start","end","mode","reasons" => [...], "profile" => nazwa aktywnego profilu]
+##
+func decide($cfg, $snap, $clock) {
+    $profile = $cfg["battery.profile"];
+    $mode = $profile;
+    $reasons = [];
+    $lim = [0, 0];
+    if ($profile === "smart") {
+        $base = $cfg["smart.base"];
+        $lim = limitsOf($cfg, $base);
+        $reasons[] = "baza: profil " . $base . " (" . limText($lim) . ")";
+        if ($snap["ac"] && $snap["acSince"] !== null) {
+            $onAc = $clock["ts"] - $snap["acSince"];
+            if ($onAc >= $cfg["smart.dock_hours"] * 3600) {
+                $lim = limitsOf($cfg, $cfg["smart.dock_profile"]);
+                $mode = "smart:dock";
+                $reasons[] = "zasilacz podłączony od " . Util.duration($onAc) . " → tryb stacjonarny (" . limText($lim) . ")";
+            }
+        }
+        $w = fullWindow($cfg, $snap["capacity"], $clock);
+        if ($w[0]) {
+            $lim = normalize(95, 100);
+            $mode = "smart:plan";
+            $when = $w[1] >= 0 ? "za " . Util.duration($w[1] * 60) : "przed chwilą";
+            $reasons[] = "plan: pełna bateria przed " . $cfg["smart.full_before"] . " (" . $when . ") → ładowanie do 100 %";
+        }
+    } else {
+        $lim = limitsOf($cfg, $profile);
+        $reasons[] = "profil " . $profile . " (" . limText($lim) . ")";
+    }
+    if ($snap["override"] === "full") {
+        $lim = normalize(95, 100);
+        $mode = "override";
+        $reasons[] = "jednorazowe pełne ładowanie — do odłączenia zasilacza";
+    }
+    $tmax = $cfg["smart.temp_max"];
+    if ($tmax > 0 && $snap["temp"] !== null && $snap["temp"] >= $tmax) {
+        $lim = normalize($lim[0], Util.clamp($snap["capacity"], 20, $lim[1]));
+        $mode .= "+temp";
+        $reasons[] = "temperatura " . Util.fixed1($snap["temp"]) . " °C ≥ " . $tmax . " °C → ładowanie wstrzymane (limit " . $lim[1] . " %)";
+    }
+    return ["start" => $lim[0], "end" => $lim[1], "mode" => $mode, "reasons" => $reasons, "profile" => $profile];
+}
+
+# ───────────────── szacunki ─────────────────
+# energie w µWh, moc w µW → sekundy; null, gdy brak danych
+func etaSeconds($snap) {
+    $p = $snap["powerUw"];
+    if ($p === null || $p <= 0) { return null; }
+    $st = $snap["status"];
+    if ($st === "Discharging" && $snap["energyNow"] !== null) { return intval(Math.floor($snap["energyNow"] * 3600 / $p)); }
+    if ($st === "Charging" && $snap["energyNow"] !== null && $snap["energyFull"] !== null) {
+        $left = $snap["energyFull"] - $snap["energyNow"];
+        return $left <= 0 ? 0 : intval(Math.floor($left * 3600 / $p));
+    }
+    return null;
+}
+
+# zdrowie ogniw w % (pojemność pełna / projektowa)
+func healthPct($snap) {
+    if ($snap["energyFull"] === null || $snap["energyDesign"] === null || $snap["energyDesign"] <= 0) { return null; }
+    return Util.clamp(intval(Math.round($snap["energyFull"] * 100 / $snap["energyDesign"])), 0, 150);
+}
