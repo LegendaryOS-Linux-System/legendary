@@ -1,0 +1,59 @@
+import Std.Os;
+import Workspace.Tools;
+import Workspace.Lpm;
+import Workspace.Ui;
+import Workspace.Util;
+
+# Test `legendary run` i `legendary tools` na atrapie lpm. Wynik: tests/tools_test.out.
+
+$d = "/tmp/legendary-test-tools";
+Os.removeAll($d);
+Os.mkdir($d);
+Os.writeFile($d . "/lpm", "#!/bin/sh\ncase \"$1 $2\" in\n  \"tools path\") case \"$3\" in\n      blue-environment) echo \"" . $d . "/blue-environment\" ;;\n      bit) echo \"mount: montowanie bit...\"; echo \"" . $d . "/bit\" ;;\n      *) echo \"brak narzędzia\" >&2; exit 1 ;;\n    esac ;;\n  \"tools list\") printf '  blue-environment  0123456789ab  zamontowane\\n  bit  abcdefabcdef  odmontowane\\n' ;;\n  \"tools add\") echo \"lpm: dodano $3\" ;;\n  \"tools add-all\") echo \"lpm: dodano wszystko\" ;;\n  \"tools remove\") echo \"lpm: usunięto $3\" ;;\n  \"tools update\") echo \"lpm: zaktualizowano $3\" ;;\n  *) echo \"lpm $*\" ;;\nesac\n");
+Os.writeFile($d . "/blue-environment", "#!/bin/sh\necho \"BE uruchomione, argumenty: $* (LEGENDARY_TOOL=$LEGENDARY_TOOL)\"\nexit 7\n");
+Os.writeFile($d . "/bit", "#!/bin/sh\necho bit\n");
+Os.writeFile($d . "/catalog.hk", "[tools]\n-> hacker-lang\n--> git => https://example.org/hl\n--> entry => bin/hl\n-> bit\n--> git => https://example.org/bit\n--> entry => bin/bit\n");
+foreach (["lpm", "blue-environment", "bit"] as $f) { Os.chmod($d . "/" . $f, 493); }
+Os.setEnv("LEGENDARY_LPM", $d . "/lpm");
+Os.setEnv("LEGENDARY_TOOLS_CATALOG", $d . "/catalog.hk");
+Os.setEnv("LEGENDARY_COLOR", "never");
+Os.setEnv("LEGENDARY_FAKE_ROOT", "1");
+
+echo "=== run blue-environment --foo bar (kod wyjścia 7 przekazany dalej)";
+echo "kod: " . Tools.run(["blue-environment", "--foo", "bar"]);
+echo "=== run -- blue-environment";
+echo "kod: " . Tools.run(["--", "blue-environment", "x"]);
+echo "=== --where i --dry-run";
+echo "kod: " . Tools.run(["--where", "blue-environment"]);
+echo "kod: " . Tools.run(["--dry-run", "blue-environment", "-a", "b"]);
+echo "=== ścieżka z komunikatem montowania (bierze ostatnią linię)";
+echo "kod: " . Tools.run(["--where", "bit"]);
+echo "=== narzędzie z katalogu, niezainstalowane";
+echo "kod: " . Tools.run(["hacker-lang"]);
+echo "=== nieznane (literówka)";
+echo "kod: " . Tools.run(["blue-enviroment"]);
+echo "=== zupełnie nieznane";
+echo "kod: " . Tools.run(["zzzzzzzzzz"]);
+echo "=== opcje po nazwie nie należą do run";
+echo "kod: " . Tools.run(["--nope", "bit"]);
+echo "kod: " . Tools.run([]);
+echo "=== tools list / catalog / info / path";
+Tools.cmd(["list"]);
+Tools.cmd(["list", "--installed"]);
+Tools.cmd(["catalog"]);
+Tools.cmd(["info", "bit"]);
+Tools.cmd(["info", "hacker-lang"]);
+Tools.cmd(["path", "blue-environment"]);
+echo "=== install / update / remove (przekazanie do lpm)";
+Tools.cmd(["install", "hacker-lang"]);
+Tools.cmd(["install", "--all"]);
+Tools.cmd(["update", "bit"]);
+Tools.cmd(["remove", "bit"]);
+echo "=== bez roota";
+Os.setEnv("LEGENDARY_FAKE_ROOT", "0");
+echo "kod: " . Tools.cmd(["install", "bit"]);
+echo "=== brak lpm";
+Os.setEnv("LEGENDARY_LPM", $d . "/nie-ma-lpm");
+echo "kod: " . Tools.run(["blue-environment"]);
+echo "kod: " . Tools.run(["--system", "sh", "-c", "exit 0"]);
+Os.removeAll($d);
