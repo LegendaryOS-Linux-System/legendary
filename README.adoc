@@ -1,1 +1,116 @@
+= legendary
+:toc:
+:toc-title: Spis treści
+:lang: pl
 
+**legendary** to narzędzie systemowe LegendaryOS napisane w 100% w https://github.com/HackerOS-Linux-System[Z#] (budowane przez *nula*, konfiguracja w `nula.hk`).
+Zastępuje skrypt `legendary-tool` i zbiera codzienne czynności w jednym, kolorowym CLI z alternatywnym interfejsem TUI.
+
+[source,sh]
+----
+legendary run blue-environment     # uruchom narzędzie z /tools (o ile jest zainstalowane)
+legendary show                     # interfejs TUI
+legendary battery                  # inteligentne ładowanie baterii
+legendary help                     # wszystkie polecenia
+----
+
+== Polecenia
+
+[cols="1,3"]
+|===
+|`run <narzędzie> [arg…]` |Uruchamia zainstalowane narzędzie (`lpm tools path`), przekazuje argumenty i kod wyjścia. Opcje: `--dry-run`, `--where`, `--system`. Przy braku narzędzia podpowiada instalację albo podobną nazwę.
+|`tools [list\|catalog\|info\|install\|update\|remove\|path\|mount]` |Narzędzia z `/tools` ze stanem montowania. Zapisy wymagają roota. `install` jest też skrótem top-level.
+|`show` |Interfejs TUI: zakładki Przegląd, Narzędzia, Bateria, Usługi, Diagnostyka, Pomoc. `--tab nazwa`, `--static`.
+|`interface` |Graficzny interfejs — *placeholder* (na razie odsyła do `show`).
+|`battery …` |Inteligentne ładowanie — patrz niżej.
+|`info [--json]` |System, jądro, pamięć, dyski, sesja, lpm, narzędzia, bateria.
+|`doctor` |Diagnostyka (lpm, `/tools`, katalog, zenitd, bateria, konfiguracja, terminal). Kod 1 przy błędach.
+|`services [list\|show <j>]` |Jednostki zenitd i ich stan włączenia (tylko odczyt).
+|`system [status\|update\|rollback\|deployments]` |Obraz systemu przez `lpm`.
+|`lpm …` |Przekazanie wprost do `lpm`.
+|`config` |Ścieżki i zmienne środowiska.
+|`completions bash\|zsh\|fish` |Skrypt uzupełniania poleceń.
+|`help [polecenie]`, `version` |Pomoc i wersja.
+|===
+
+Flagi globalne: `--no-color`, `--color=auto|always|never`, `-v`, `-q`. Kolory wyłączają się same poza terminalem i przy `NO_COLOR`.
+Wszystko po nazwie narzędzia w `run` trafia do tego narzędzia bez interpretacji.
+
+== Inteligentne ładowanie (`legendary battery`)
+
+Używa progów ładowania z jądra (`/sys/class/power_supply/BAT*/charge_control_{start,end}_threshold`) — zapisuje je firmware, więc działają także przy wyłączonym komputerze.
+Sprzęt bez progów: `status`, `history` i `watch` nadal działają, a `apply` zgłasza brak wsparcia.
+
+.Profile
+[cols="1,1,3"]
+|===
+|`smart` |adaptacyjny |baza + reguły poniżej (domyślny)
+|`full` |95–100 % |maksymalny czas pracy (podróż)
+|`balanced` |75–90 % |codziennie
+|`longevity` |40–80 % |najmniejsze zużycie ogniw
+|`docked` |40–60 % |laptop stale na zasilaczu
+|`custom` |własne |`legendary battery limit 40 80`
+|===
+
+.Reguły profilu `smart` (każda kolejna może nadpisać poprzednią)
+. profil bazowy (`smart.base`),
+. *tryb stacjonarny*: zasilacz podłączony nieprzerwanie ≥ `smart.dock_hours` → progi `smart.dock_profile`,
+. *plan „pełna bateria przed godziną X”* (`smart.full_before`, `smart.full_days`): ładowanie do 100 % rusza na tyle wcześniej, ile wynika z poziomu baterii i `smart.charge_rate` (%/h),
+. *jednorazowe pełne ładowanie* (`legendary battery full`) — do odłączenia zasilacza,
+. *ochrona termiczna* (zawsze na końcu): temperatura ≥ `smart.temp_max` → ładowanie wstrzymane.
+
+[source,sh]
+----
+legendary battery                          # status: poziom, zdrowie, moc, czas, progi, aktywna polityka
+sudo legendary battery profile longevity
+sudo legendary battery limit 80            # = custom 75–80
+sudo legendary battery set smart.full_before 07:30
+sudo legendary battery full                # dziś potrzebuję 100 %
+legendary battery history                  # po włączeniu usługi legendary-battery
+legendary battery config --keys            # wszystkie klucze z opisami
+----
+
+Konfiguracja: `/state/etc/legendary/battery.hk` (zapis), z odczytem także z `/etc/legendary/`
+i `/usr/share/legendaryos/battery.hk` (domyślna — `dist/`). Zmiany zachowują komentarze w pliku.
+Progi są zapisywane w kolejności bezpiecznej dla firmware (nigdy start ≥ koniec).
+
+== Budowanie
+
+[source,sh]
+----
+nula build --release            # normalnie
+z# build --release -o legendary # pierwszy raz, bez nuli (używa Z#.toml)
+z# run mod/main.zsharp info     # bez budowania
+nula test                       # tests/*.zsharp, wzorce w .out
+----
+
+== Integracja z LegendaryOS (`dist/`)
+
+Pliki do skopiowania do szablonu dystrybucji (`files/`) w LegendaryOS-Builder:
+
+* `dist/usr/lib/zenit/system/legendary-battery.service` — daemon baterii (włącz w multi-user.target),
+* `dist/usr/share/legendaryos/battery.hk` — domyślna konfiguracja,
+* `dist/usr/share/wayland-sessions/blue-environment.desktop` — `Exec=legendary run blue-environment`,
+* `dist/usr/bin/legendary-tool` — opcjonalna zgodność wsteczna (`exec legendary run "$@"`).
+
+Binarkę umieść w `/usr/bin/legendary`. Uzupełnianie: `legendary completions bash > /etc/bash_completion.d/legendary`.
+
+TIP: `blue-environment` nie ma jeszcze wpisu w `tools.hk` — dodaj go, żeby `legendary install blue-environment` działało z katalogu.
+
+== Układ kodu
+
+`mod/main.zsharp` (wejście i dispatch) oraz moduły z `namespace`: `Util`, `Ui`, `Cli`, `Hk`, `Help`, `Plan` (czysta logika ładowania),
+`Lpm`, `Tools`, `Battery`, `Sysinfo`, `Services`, `Doctor`, `Complete`, `Tui`.
+
+== Stan i weryfikacja
+
+Sprawdzone na interpreterze stage0 Z# (`zsc0`): `check` wszystkich modułów, manifest oraz testy w `tests/` (logika planu, bateria na sztucznym sysfs,
+narzędzia na atrapie `lpm`, TUI sterowane skryptem klawiszy, Ui/Cli/Hk/Util).
+
+Niesprawdzone (brak sprzętu/środowiska):
+
+* kompilacja przez `z# build` / `nula build` (backend `c`),
+* odczyt klawiszy w prawdziwym terminalu (skrypt `stty`+`dd` w `Tui`) i zmiana rozmiaru okna,
+* zapis progów na prawdziwym sprzęcie (testy używają sztucznego sysfs; nazwy plików są standardowe w jądrze ≥ 5.4),
+* format wyjścia `lpm tools list` (parser opiera się na kodzie `toolcmd.h#`),
+* czy zenitd akceptuje `Type=simple` bez `Restart=` w jednostce `legendary-battery.service`.
